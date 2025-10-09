@@ -1,0 +1,6 @@
+libslab.so
+t/stress
+*.o
+*.so
+core
+core.*
