@@ -4,8 +4,9 @@
  * Memory comes from mmap(2) only.  Address space is carved into 64 KiB
  * SPANS; every span is 64 KiB-aligned, so given any pointer we recover its
  * metadata with one AND instruction.  A span belongs to exactly one size
- * class and hands out objects of that class.  Allocations too big for the
- * largest class get their own mmap.
+ * class and hands out objects of that class; each class keeps a global free
+ * list threaded through the free objects themselves.  Allocations too big
+ * for the largest class get their own mmap.
  *
  * WHY THE SPAN TRICK:  the obvious alternative is a per-allocation header
  * holding the size.  That costs 16 bytes on every object (8 for the size,
@@ -91,6 +92,7 @@ _Static_assert(sizeof(struct hdr) <= HDR, "span header must fit in HDR bytes");
 _Static_assert(HDR % 16 == 0, "payload offset must preserve 16-byte alignment");
 
 struct klass {
+	void       *freelist;   /* singly linked through the free objects */
 	struct hdr *cur;        /* span we are currently bump-allocating from */
 };
 
@@ -174,12 +176,18 @@ static struct hdr *span_new(unsigned cls)
 	return h;
 }
 
-/* Bump-allocate the next never-used object out of the class's current span.
- * Objects start at offset HDR and every class size is a multiple of 16, so
- * every object in a 64 KiB-aligned span is 16-byte aligned. */
+/* Pop the class's free list; failing that, bump-allocate the next never-used
+ * object out of the class's current span.  Objects start at offset HDR and
+ * every class size is a multiple of 16, so every object in a 64 KiB-aligned
+ * span is 16-byte aligned. */
 static void *alloc_small(unsigned cls)
 {
 	struct klass *k = &klass[cls];
+	void *p = k->freelist;
+	if (p) {
+		k->freelist = *(void **)p;
+		return p;
+	}
 	struct hdr *h = k->cur;
 	if (!h || h->bump == h->cap) {
 		h = span_new(cls);
@@ -187,7 +195,7 @@ static void *alloc_small(unsigned cls)
 			return NULL;
 		k->cur = h;
 	}
-	void *p = (char *)h + h->bump;
+	p = (char *)h + h->bump;
 	h->bump += cls_size[cls];
 	return p;
 }
@@ -277,11 +285,12 @@ void free(void *p)
 		munmap(b, l);
 		return;
 	}
+	/* The freed object is itself the free-list node: the smallest class is
+	 * 16 bytes, so there is always room for the next pointer in the first 8
+	 * bytes of dead memory, and the list costs no metadata at all. */
+	*(void **)p = klass[h->cls].freelist;
+	klass[h->cls].freelist = p;
 	unlock();
-	/* A small object is leaked: a span is only ever bump-allocated forward,
-	 * so there is nowhere to put it back yet.  The free list arrives in the
-	 * next commit; until then slab is a correct allocator that never reuses
-	 * memory below 8 KiB. */
 }
 
 void *calloc(size_t n, size_t m)
