@@ -11,12 +11,17 @@ CFLAGS  = -std=c11 -O2 -Wall -Wextra -fPIC \
 	  -fno-builtin-realloc -fno-builtin-free
 LDFLAGS = -shared
 
-all: libslab.so
+TFLAGS  = -std=gnu11 -O2 -Wall -Wextra
+
+all: libslab.so t/stress
 
 libslab.so: slab.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
+t/stress: t/stress.c
+	$(CC) $(TFLAGS) -o $@ $<
+
 clean:
-	rm -f libslab.so
+	rm -f libslab.so t/stress
 
 .PHONY: all clean
