@@ -1,6 +1,12 @@
 /*
  * t/stress.c - the part of the oracle that a shell script cannot express.
  *
+ * Mode `stress`: millions of random malloc/calloc/posix_memalign/realloc/
+ * free over 2048 live slots, each block filled with a byte pattern derived
+ * from a unique tag and verified on every subsequent touch.  This is what
+ * actually catches overlapping allocations: if two live blocks share a byte,
+ * one of them reads a pattern byte that belongs to the other.
+ *
  * Mode `check`: semantic conformance.  Alignment of every size from 0 to
  * 4096 plus large and over-aligned cases, calloc zeroing, realloc content
  * preservation across every class boundary in both directions,
@@ -303,11 +309,105 @@ static void check_no_overlap(void)
 	free(v);
 }
 
+/* ---------------- stress mode ---------------- */
+
+struct slot { unsigned char *p; size_t n; uint32_t tag; };
+
+static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed)
+{
+	uint64_t s = seed | 1;
+	uint32_t tag = (uint32_t)seed;
+
+	for (long it = 0; it < iters; it++) {
+		unsigned i = (unsigned)(rnd(&s) % nslots);
+		struct slot *b = &v[i];
+
+		if (!b->p) {
+			b->n = pick_size(&s);
+			b->tag = ++tag;
+			unsigned mode = (unsigned)(rnd(&s) % 10);
+			if (mode == 0) {
+				b->p = calloc(1, b->n);
+				if (b->p) {
+					for (size_t j = 0; j < b->n; j++)
+						if (b->p[j]) {
+							printf("  FAIL calloc(%zu) not zeroed at %zu\n", b->n, j);
+							failures++;
+							break;
+						}
+				}
+			} else if (mode == 1) {
+				void *q = NULL;
+				size_t a = (size_t)16 << (rnd(&s) % 8);
+				if (posix_memalign(&q, a, b->n) == 0) {
+					if ((uintptr_t)q & (a - 1)) {
+						printf("  FAIL memalign %zu misaligned\n", a);
+						failures++;
+					}
+					b->p = q;
+				}
+			} else {
+				b->p = malloc(b->n);
+			}
+			if (!b->p) {
+				printf("  FAIL out of memory at iter %ld\n", it);
+				failures++;
+				return;
+			}
+			fill(b->p, b->tag, b->n);
+			continue;
+		}
+
+		if (!verify(b->p, b->tag, b->n)) {
+			printf("  FAIL block %u (%zu bytes, tag %u) clobbered at iter %ld\n",
+			       i, b->n, b->tag, it);
+			failures++;
+			b->p = NULL;        /* stop cascading on the same block */
+			continue;
+		}
+
+		if (rnd(&s) % 2) {
+			free(b->p);
+			b->p = NULL;
+		} else {
+			size_t nn = pick_size(&s);
+			unsigned char *q = realloc(b->p, nn);
+			if (!q) {
+				printf("  FAIL realloc(%zu -> %zu) failed\n", b->n, nn);
+				failures++;
+				return;
+			}
+			size_t keep = b->n < nn ? b->n : nn;
+			if (keep > EDGE)
+				keep = EDGE;
+			if (!verify_prefix(q, b->tag, keep)) {
+				printf("  FAIL realloc %zu -> %zu lost content\n", b->n, nn);
+				failures++;
+			}
+			b->p = q;
+			b->n = nn;
+			fill(b->p, b->tag, b->n);
+		}
+	}
+	for (unsigned i = 0; i < nslots; i++)
+		if (v[i].p) {
+			if (!verify(v[i].p, v[i].tag, v[i].n)) {
+				printf("  FAIL block %u clobbered at drain\n", i);
+				failures++;
+			}
+			free(v[i].p);
+			v[i].p = NULL;
+		}
+}
+
+#define NSLOT 2048
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "check";
+	long n = argc > 2 ? atol(argv[2]) : 0;
 
 	if (!strcmp(mode, "check")) {
 		check_free_null();
@@ -317,8 +417,11 @@ int main(int argc, char **argv)
 		check_memalign();
 		check_malloc0();
 		check_no_overlap();
+	} else if (!strcmp(mode, "stress")) {
+		static struct slot v[NSLOT];
+		churn(v, NSLOT, n ? n : 2000000, 0xfeedfaceull);
 	} else {
-		fprintf(stderr, "usage: stress check\n");
+		fprintf(stderr, "usage: stress check|stress [iters]\n");
 		return 2;
 	}
 
