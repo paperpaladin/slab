@@ -19,7 +19,7 @@ libslab.so: slab.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 t/stress: t/stress.c
-	$(CC) $(TFLAGS) -o $@ $<
+	$(CC) $(TFLAGS) -o $@ $< -lpthread
 
 test: all
 	@t/run.sh

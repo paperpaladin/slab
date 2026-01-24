@@ -7,6 +7,10 @@
  * actually catches overlapping allocations: if two live blocks share a byte,
  * one of them reads a pattern byte that belongs to the other.
  *
+ * Mode `thread`: the same churn on 4 threads, with blocks handed between
+ * threads through a shared pool so cross-thread free() is exercised against
+ * the global free lists.
+ *
  * Mode `check`: semantic conformance.  Alignment of every size from 0 to
  * 4096 plus large and over-aligned cases, calloc zeroing, realloc content
  * preservation across every class boundary in both directions,
@@ -22,6 +26,7 @@
 
 #define _GNU_SOURCE
 #include <malloc.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -313,7 +318,8 @@ static void check_no_overlap(void)
 
 struct slot { unsigned char *p; size_t n; uint32_t tag; };
 
-static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed)
+static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed,
+		  struct slot *shared, unsigned nshared, pthread_mutex_t *mu)
 {
 	uint64_t s = seed | 1;
 	uint32_t tag = (uint32_t)seed;
@@ -366,10 +372,11 @@ static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed)
 			continue;
 		}
 
-		if (rnd(&s) % 2) {
+		unsigned act = (unsigned)(rnd(&s) % 10);
+		if (act < 4) {
 			free(b->p);
 			b->p = NULL;
-		} else {
+		} else if (act < 8) {
 			size_t nn = pick_size(&s);
 			unsigned char *q = realloc(b->p, nn);
 			if (!q) {
@@ -387,6 +394,25 @@ static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed)
 			b->p = q;
 			b->n = nn;
 			fill(b->p, b->tag, b->n);
+		} else if (shared) {
+			/* Hand this block to whichever thread takes the slot
+			 * next, and adopt whatever was there - so a block is
+			 * routinely freed by a thread other than the one that
+			 * allocated it, which is the case a per-thread cache
+			 * would get wrong and a global free list must not. */
+			unsigned j = (unsigned)(rnd(&s) % nshared);
+			pthread_mutex_lock(mu);
+			struct slot t = shared[j];
+			shared[j] = *b;
+			pthread_mutex_unlock(mu);
+			if (t.p) {
+				if (!verify(t.p, t.tag, t.n)) {
+					printf("  FAIL shared block clobbered\n");
+					failures++;
+				}
+				free(t.p);
+			}
+			b->p = NULL;
 		}
 	}
 	for (unsigned i = 0; i < nslots; i++)
@@ -401,6 +427,20 @@ static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed)
 }
 
 #define NSLOT 2048
+#define NSHARED 128
+
+static struct slot shared[NSHARED];
+static pthread_mutex_t shmu = PTHREAD_MUTEX_INITIALIZER;
+static long thr_iters;
+
+static void *worker(void *arg)
+{
+	struct slot *v = calloc(NSLOT, sizeof *v);
+	churn(v, NSLOT, thr_iters, (uint64_t)(uintptr_t)arg * 0x9e3779b97f4a7c15ull + 1,
+	      shared, NSHARED, &shmu);
+	free(v);
+	return NULL;
+}
 
 /* ---------------- main ---------------- */
 
@@ -419,9 +459,24 @@ int main(int argc, char **argv)
 		check_no_overlap();
 	} else if (!strcmp(mode, "stress")) {
 		static struct slot v[NSLOT];
-		churn(v, NSLOT, n ? n : 2000000, 0xfeedfaceull);
+		churn(v, NSLOT, n ? n : 2000000, 0xfeedfaceull, NULL, 0, NULL);
+	} else if (!strcmp(mode, "thread")) {
+		pthread_t th[4];
+		thr_iters = n ? n : 400000;
+		for (int i = 0; i < 4; i++)
+			pthread_create(&th[i], NULL, worker, (void *)(uintptr_t)(i + 1));
+		for (int i = 0; i < 4; i++)
+			pthread_join(th[i], NULL);
+		for (unsigned i = 0; i < NSHARED; i++)
+			if (shared[i].p) {
+				if (!verify(shared[i].p, shared[i].tag, shared[i].n)) {
+					printf("  FAIL shared residue clobbered\n");
+					failures++;
+				}
+				free(shared[i].p);
+			}
 	} else {
-		fprintf(stderr, "usage: stress check|stress [iters]\n");
+		fprintf(stderr, "usage: stress check|stress|thread [iters]\n");
 		return 2;
 	}
 
