@@ -11,7 +11,11 @@ CFLAGS  = -std=c11 -O2 -Wall -Wextra -fPIC \
 	  -fno-builtin-realloc -fno-builtin-free
 LDFLAGS = -shared
 
-TFLAGS  = -std=gnu11 -O2 -Wall -Wextra
+# The oracle must not be allowed to assume that malloc/calloc behave: gcc
+# knows what they promise and will constant-fold the checks into "true".
+TFLAGS  = -std=gnu11 -O2 -Wall -Wextra \
+	  -fno-builtin-malloc -fno-builtin-calloc \
+	  -fno-builtin-realloc -fno-builtin-free
 
 all: libslab.so t/stress
 
