@@ -11,6 +11,9 @@
  * threads through a shared pool so cross-thread free() is exercised against
  * the global free lists.
  *
+ * Mode `bench`: timing, printed as "name ns/op".  Five phases chosen to
+ * separate where slab is competitive from where it is not.
+ *
  * Mode `check`: semantic conformance.  Alignment of every size from 0 to
  * 4096 plus large and over-aligned cases, calloc zeroing, realloc content
  * preservation across every class boundary in both directions,
@@ -30,6 +33,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 static int failures;
@@ -460,6 +464,118 @@ static void *worker(void *arg)
 	return NULL;
 }
 
+/* ---------------- bench mode ---------------- */
+
+static double now(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static void report(const char *name, double secs, long ops)
+{
+	printf("%-22s %8.1f ns/op\n", name, secs / ops * 1e9);
+}
+
+static void bench_small(long iters)
+{
+	void *v[1024] = {0};
+	uint64_t s = 1;
+	double t0 = now();
+	for (long i = 0; i < iters; i++) {
+		unsigned k = (unsigned)(rnd(&s) % 1024);
+		if (v[k]) { free(v[k]); v[k] = NULL; }
+		else { v[k] = malloc(8 + rnd(&s) % 248); *(char *)v[k] = 1; }
+	}
+	double t = now() - t0;
+	for (unsigned k = 0; k < 1024; k++)
+		free(v[k]);
+	report("small-churn", t, iters);
+}
+
+static void bench_mixed(long iters)
+{
+	void *v[512] = {0};
+	size_t n[512] = {0};
+	uint64_t s = 2;
+	double t0 = now();
+	for (long i = 0; i < iters; i++) {
+		unsigned k = (unsigned)(rnd(&s) % 512);
+		if (v[k]) { free(v[k]); v[k] = NULL; }
+		else { n[k] = pick_size(&s); v[k] = malloc(n[k]);
+		       memset(v[k], 1, n[k] < 64 ? n[k] : 64); }
+	}
+	double t = now() - t0;
+	for (unsigned k = 0; k < 512; k++)
+		free(v[k]);
+	report("mixed-sizes", t, iters);
+}
+
+static void bench_grow(long iters)
+{
+	double t0 = now();
+	long ops = 0;
+	for (long i = 0; i < iters; i++) {
+		size_t n = 8;
+		char *p = malloc(n);
+		while (n < 65536) {
+			size_t m = n * 2;
+			p = realloc(p, m);
+			p[m - 1] = 1;
+			n = m;
+			ops++;
+		}
+		free(p);
+	}
+	report("realloc-grow", now() - t0, ops);
+}
+
+static void bench_large(long iters)
+{
+	void *v[64] = {0};
+	uint64_t s = 3;
+	double t0 = now();
+	for (long i = 0; i < iters; i++) {
+		unsigned k = (unsigned)(rnd(&s) % 64);
+		if (v[k]) { free(v[k]); v[k] = NULL; }
+		else { size_t n = 16384 + rnd(&s) % (1u << 20);
+		       v[k] = malloc(n); *(char *)v[k] = 1; }
+	}
+	double t = now() - t0;
+	for (unsigned k = 0; k < 64; k++)
+		free(v[k]);
+	report("large-churn", t, iters);
+}
+
+static long mt_iters;
+
+static void *mt_worker(void *arg)
+{
+	void *v[256] = {0};
+	uint64_t s = (uint64_t)(uintptr_t)arg + 7;
+	for (long i = 0; i < mt_iters; i++) {
+		unsigned k = (unsigned)(rnd(&s) % 256);
+		if (v[k]) { free(v[k]); v[k] = NULL; }
+		else { v[k] = malloc(8 + rnd(&s) % 248); *(char *)v[k] = 1; }
+	}
+	for (unsigned k = 0; k < 256; k++)
+		free(v[k]);
+	return NULL;
+}
+
+static void bench_threads(long iters, int nthreads)
+{
+	pthread_t th[8];
+	mt_iters = iters;
+	double t0 = now();
+	for (int i = 0; i < nthreads; i++)
+		pthread_create(&th[i], NULL, mt_worker, (void *)(uintptr_t)i);
+	for (int i = 0; i < nthreads; i++)
+		pthread_join(th[i], NULL);
+	report("4-thread-churn", now() - t0, iters * nthreads);
+}
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
@@ -493,8 +609,16 @@ int main(int argc, char **argv)
 				}
 				free(shared[i].p);
 			}
+	} else if (!strcmp(mode, "bench")) {
+		long it = n ? n : 2000000;
+		bench_small(it);
+		bench_mixed(it / 4);
+		bench_grow(it / 200);
+		bench_large(it / 500);
+		bench_threads(it / 4, 4);
+		return 0;
 	} else {
-		fprintf(stderr, "usage: stress check|stress|thread [iters]\n");
+		fprintf(stderr, "usage: stress check|stress|thread|bench [iters]\n");
 		return 2;
 	}
 

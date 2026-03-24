@@ -28,7 +28,14 @@ t/stress: t/stress.c
 test: all
 	@t/run.sh
 
+# Five repetitions each; read the spread, not the first number.
+bench: all
+	@echo "== glibc malloc =="
+	@for i in 1 2 3 4 5; do ./t/stress bench; echo; done
+	@echo "== slab =="
+	@for i in 1 2 3 4 5; do LD_PRELOAD=./libslab.so ./t/stress bench; echo; done
+
 clean:
 	rm -f libslab.so t/stress
 
-.PHONY: all test clean
+.PHONY: all test bench clean
