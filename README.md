@@ -26,7 +26,7 @@ object. That is the one benchmark slab wins, and it wins it by 39%.
 
 ## The oracle
 
-`make test` runs 24 checks in three tiers.
+`make test` runs 27 checks in three tiers.
 
 **Tier 1, which is the whole point:** real system binaries, run twice -- once
 normally, once with `LD_PRELOAD=./libslab.so` -- demanding that stdout,
@@ -51,8 +51,12 @@ threads with blocks handed between them so cross-thread `free` is exercised.
 The stress and semantic tests also run against glibc `malloc`, because if
 they fail there then the test is wrong, not slab.
 
-**Tier 3:** the oracle checked for teeth. `make test` builds a slab whose
-objects overlap by 8 bytes and asserts the stress test rejects it.
+**Tier 3:** the oracle checked for teeth, by mutation. `make test` builds four
+deliberately broken slabs -- objects that overlap by 8 bytes, a `calloc` that
+never zeroes, a `realloc` that copies half the bytes, a class index one too
+small for one octave -- and requires each to be rejected *by the check that
+owns that behaviour*, not merely by some check somewhere. That distinction is
+load-bearing; see below.
 
 ```
 $ make test
@@ -79,27 +83,59 @@ ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
 ok    peak RSS 1.08x glibc on a churn workload (limit 3.0x)
-ok    self-check: oracle rejects an allocator with overlapping objects
+ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
+ok    self-check: 'stress check' rejects a calloc that never zeroes
+ok    self-check: 'stress check' rejects a realloc that copies half the bytes
+ok    self-check: 'stress check' rejects a class index one too small for one octave
 
-24 passed, 0 failed
+27 passed, 0 failed
 ```
 
 ### What the oracle caught
 
-The stress test did not find a bug in the allocator -- all 24 checks passed on
-the first full run. It did find a bug in *itself*, which is more interesting.
+Two bugs, and gcc caused both of them. Neither was an allocator logic error:
+the byte-pattern stress test has never found slab writing outside a block.
 
-Mutation testing (build a deliberately broken slab, confirm the suite
-rejects it) found that a slab whose `calloc` **never zeroed anything at all**
-passed cleanly. The reason: gcc knows what `calloc` is declared to promise,
-so at `-O2` it proved the zero-checking loop could not observe a non-zero
-byte and deleted the loop. The same hazard applied to the alignment checks,
-since gcc also knows `malloc` returns `max_align_t`-aligned memory. The fix
-is in `t/stress.c`: every pointer is laundered through an `asm volatile`
-barrier before it is inspected, the `calloc` checks read through a `volatile`
-pointer, and the oracle is compiled with `-fno-builtin-malloc
--fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free`. With that in
-place all six mutants are caught:
+**The loud one.** The small-object `calloc` was first written as `malloc()`
+followed by `memset(0)`. gcc recognises exactly that idiom and rewrites it
+into a call to `calloc` -- which, compiled into this file, is a PLT call back
+into *our own* `calloc`. Unconditional infinite tail-recursion.
+`/usr/bin/wc` hung, and `objdump -d libslab.so` showed `jmp calloc@plt`
+sitting at the end of `calloc`. The fix is `-fno-builtin-malloc
+-fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free` on `libslab.so`
+itself: inside the implementation of these functions, the compiler's
+knowledge of what their names mean is a liability. `calloc` also stopped
+calling `malloc` at all, so the idiom is not there to be recognised.
+
+**The quiet one, which is the more interesting half.** Mutation testing found
+that a slab whose `calloc` **never zeroed a single byte** passed the targeted
+`calloc` check. The check was there -- dirty a block with `0xaa`, free it,
+`calloc` the same size, read every byte -- and gcc deleted the loop, because
+it knows what `calloc` is declared to promise and proved the loop could not
+observe a nonzero byte. The suite was testing the C standard, not slab. The
+same argument applies to every alignment check, since gcc also knows `malloc`
+returns `max_align_t`-aligned memory.
+
+It took one more step to even see it. The random churn in `stress` mode *does*
+catch that mutant, because there gcc cannot see through a pointer kept in a
+struct behind a dynamic loop bound. So a tier 3 that accepted a rejection
+from any mode would have printed "rejected", stayed green, and left
+`check_calloc` as dead code forever. Pinning each mutant to the check that
+owns the behaviour is what turned a green tick into a statement.
+
+The fix is three-layered, because any single layer is a bet on compiler
+behaviour and the whole lesson is that those bets lose silently: every pointer
+is laundered through an `asm volatile` barrier with a memory clobber before it
+is inspected, the `calloc` checks read through a `volatile` pointer, and the
+oracle is compiled `-fno-builtin-malloc -fno-builtin-calloc
+-fno-builtin-realloc -fno-builtin-free`.
+
+The contrast is the lesson worth keeping. The compiler bug in the allocator
+was found in minutes by running a real program. The compiler bug in the test
+cost nothing, broke nothing, and would have sat there indefinitely looking
+like evidence. Only deliberately breaking the allocator found it.
+
+With the hardening in place all six mutants are caught:
 
 | mutant | caught by |
 | --- | --- |
@@ -109,6 +145,9 @@ place all six mutants are caught:
 | a class size not a multiple of 16 | alignment check and `usable_size` |
 | `realloc` copies half the bytes | `realloc 101 -> 128 lost content` |
 | objects overlap by 8 bytes | pattern mismatch within 81 iterations |
+
+Four of the six are permanent fixtures of `make test` (tier 3); the other two
+were one-off probes.
 
 ## Benchmarks
 
@@ -216,6 +255,9 @@ it, including `gcc` compiling C and CPython running a JSON workload.
 - **`malloc_stats`, `malloc_trim`, `mallopt`** are accepted and ignored.
   `malloc_info`, `mcheck`, `mtrace` and the glibc hook variables are not
   provided at all.
+- **Building `libslab.so` without `-fno-builtin-malloc`/`-calloc`/`-realloc`/
+  `-free`** produces an allocator that can recurse into itself. The flags are
+  in the `Makefile` with a comment; they are not optional.
 - 32-bit, non-x86-64, and non-glibc C libraries are untested.
 
 ## Design
