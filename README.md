@@ -22,11 +22,11 @@ It is also an answer to a narrower question: how much does a per-object
 header cost? glibc puts 8 to 16 bytes of chunk metadata in front of every
 allocation. slab puts 64 bytes at the base of each 64 KiB span instead and
 finds it with one `AND`, which is 0.1% overhead instead of 100% on a 16-byte
-object. That is the one benchmark slab wins, and it wins it by 39%.
+object. That is the footprint benchmark slab wins, and it wins it by 39%.
 
 ## The oracle
 
-`make test` runs 27 checks in three tiers.
+`make test` runs 30 checks in three tiers.
 
 **Tier 1, which is the whole point:** real system binaries, run twice -- once
 normally, once with `LD_PRELOAD=./libslab.so` -- demanding that stdout,
@@ -88,7 +88,7 @@ ok    self-check: 'stress check' rejects a calloc that never zeroes
 ok    self-check: 'stress check' rejects a realloc that copies half the bytes
 ok    self-check: 'stress check' rejects a class index one too small for one octave
 
-27 passed, 0 failed
+30 passed, 0 failed
 ```
 
 ### What the oracle caught
@@ -159,13 +159,22 @@ turbo control -- treat anything under 15% as noise. Reproduce with
 `make bench` (which does 5 runs of each; the table used 7). Single-threaded
 phases are one thread; the last is 4 threads on an 8-core machine.
 
-| phase | glibc (ns/op) | slab (ns/op) | ratio |
-| --- | --- | --- | --- |
-| `small-churn` -- 8-256 B, 1024 live slots | 15.2 (14.6-20.4) | **14.0** (13.5-15.3) | 0.92x |
-| `mixed-sizes` -- 70/20/8/2% size mix to 256 KiB | **41.1** (37.6-43.6) | 116.5 (106.9-134.8) | 2.8x slower |
-| `realloc-grow` -- doubling 8 B → 64 KiB | **55.9** (50.2-63.5) | 4020 (3931-4158) | **72x slower** |
-| `large-churn` -- 16 KiB-1 MiB, 64 live slots | **622** (554-700) | 4765 (4490-5002) | 7.7x slower |
-| `4-thread-churn` -- 8-256 B, 4 threads | **5.3** (3.5-6.0) | 82.4 (67.1-89.3) | **16x slower** |
+All three slab columns come from one sitting, the "one lock" one being
+`slab.c` at the commit before per-thread magazines, rebuilt with the same
+flags. Comparing a new number against a figure measured on a different day is
+how a change gets credit for the weather.
+
+| phase | glibc (ns/op) | slab, one lock | slab, magazines | ratio now |
+| --- | --- | --- | --- | --- |
+| `small-churn` -- 8-256 B, 1024 live slots | 14.0 (13.7-14.6) | 14.3 (14.0-15.4) | **13.6** (13.4-13.9) | 0.97x |
+| `mixed-sizes` -- 70/20/8/2% size mix to 256 KiB | **37.4** (35.6-39.5) | 116.9 (113.6-132.6) | 113.7 (111.3-124.1) | 3.0x slower |
+| `realloc-grow` -- doubling 8 B to 64 KiB | **50.3** (46.5-55.2) | 4065 (3930-4169) | 4098 (3778-4292) | **81x slower** |
+| `large-churn` -- 16 KiB-1 MiB, 64 live slots | **576** (512-602) | 4814 (4642-5825) | 4624 (4555-4856) | 8.0x slower |
+| `4-thread-churn` -- 8-256 B, 4 threads | 3.6 (3.4-5.2) | 74.8 (56.7-87.0) | 4.4 (4.2-6.3) | 1.2x slower |
+
+The magazines moved one row and left the other four where they were, which is
+what should happen: they take the lock off the small-object path, and nothing
+else in the table was waiting on the lock.
 
 Footprint, 2 million simultaneous live allocations, peak RSS divided by
 allocation count (includes an 8-byte index entry per allocation, so subtract
@@ -192,14 +201,14 @@ them badly.
   header lookup the whole design rests on. The fix is to reserve a
   `PROT_NONE` tail per large mapping and `mprotect` it in, so growth never
   has to move; that is the third item in `PLAN.md`.
-- **4-thread churn, 16x slower.** One global spinlock, no per-thread caches.
-  glibc gets *faster* per operation with more threads (5.3 ns/op across 4
-  threads versus 15.2 single-threaded) because per-thread tcaches mean the
-  threads barely interact. slab gets 6x *slower* than its own
-  single-threaded number, because every operation serializes and the threads
-  spend their time ping-ponging one cache line. A global lock was a
-  deliberate shortcut -- it is marked `shortcut:` in `slab.c` with the
-  ceiling named -- but the measured cost of that shortcut is this row.
+- **4-thread churn is a tie now, and was the worst row in the table.** Under
+  one global lock it ran at 74.8 ns/op against glibc's 3.6 -- 21x, and 5x
+  slower than slab's *own* single-threaded number, because every malloc and
+  every free serialized on one cache line and the threads spent their time
+  ping-ponging it. Per-class, per-thread magazines take the lock off that path
+  and the row is 4.4 against 3.6. The ranges overlap (4.2-6.3 against
+  3.4-5.2), so the honest claim is "about the same as glibc" rather than a
+  win. The 21x is gone either way.
 - **Large-block churn, 7.7x slower.** glibc keeps freed large blocks in its
   top chunk or its `mmap` cache and hands them straight back; slab calls
   `munmap` on every free and `mmap` on every allocation, so every block is
@@ -229,8 +238,21 @@ it, including `gcc` compiling C and CPython running a JSON workload.
 - **Returning memory to the OS.** Never happens. Spans are mapped once and
   kept forever. A program with a 500 MB transient peak of small objects
   holds 500 MB until it exits.
-- **Multithreaded performance.** See the benchmark; 16x slower than glibc at
-  4 threads. Correct, but a global lock.
+- **Objects stranded on a dead thread's magazine come back late, not never.**
+  A thread that exits leaves its magazines in the registry holding up to 8 KiB
+  per size class, and that memory is unavailable until some later thread
+  claims that set. The cost is therefore bounded by peak thread count rather
+  than by threads created: the thread-churn test holds peak RSS at 1.00x glibc
+  across a thousand sequentially created threads, and removing the adoption
+  takes that same measurement to 17x. A program whose thread count peaks high
+  and then settles low keeps the high-water mark's worth of magazines.
+- **Nothing of ours runs when a thread exits.** The usual mechanism is a
+  `pthread_key_create` destructor, not used here because
+  `pthread_setspecific` allocates for key indices past the first level and
+  would call back into us in the middle of our own bookkeeping. Adoption
+  tested with `tgkill(tid, 0)` is the substitute, and it is lazy by nature:
+  memory returns when another thread asks for magazines, not when the owner
+  dies.
 - **`fork()` without `exec()` in a multithreaded program.** If a thread
   holds the spinlock when another thread forks, the child inherits a locked
   lock and hangs on its first allocation. There is no `pthread_atfork`
@@ -324,12 +346,30 @@ variables (a first dynamic-TLS access can reach `malloc` through
 `__tls_get_addr`), no `pthread_once`, no `atexit`. Diagnostics go through
 `write(2)`.
 
-**Thread safety** is one global spinlock with a `pause` loop and a
-`sched_yield` after 2000 spins. See the benchmark for what that costs, and
-the `shortcut:` comment on it in `slab.c` for the upgrade path.
+**Thread safety** is per-class, per-thread magazines over one global
+spinlock. A magazine is a free list threaded through the free objects, the
+same trick the global lists use, so it costs one pointer and one count per
+class and no metadata per object at all. `malloc` pops it and `free` pushes it
+with no lock; the lock appears only to refill an empty magazine or drain a
+full one, in batches of up to 4 KiB worth of objects, and for new spans and
+large allocations. The spinlock under all that is a `pause` loop with a
+`sched_yield` after 2000 spins.
+
+The single `__thread` variable is an eight-byte pointer declared
+`tls_model("initial-exec")`, the exception to the no-TLS rule above: that
+model resolves the offset at load time, so the access is one `%fs`-relative
+load with no call and nothing lazy to allocate. It is only valid for an object
+present at program start, which is how this one is loaded. A `dlopen`ed slab
+would be refused by the loader for want of static TLS surplus, which is a far
+louder failure than the recursion the model avoids.
+
+The magazines themselves sit in our own `mmap`ed memory rather than in TLS,
+and a registry of them outlives every thread -- which is what makes it
+possible to hand a dead thread's magazines to a live one instead of losing the
+objects on them. See "What does not work" for where that stops.
 
 Deliberate shortcuts are marked `shortcut:` in `slab.c`, each naming the
-ceiling it imposes and the upgrade path out of it. There are six.
+ceiling it imposes and the upgrade path out of it. There are five.
 
 ## License
 
