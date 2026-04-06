@@ -204,6 +204,36 @@ else
 	bad "peak RSS ${tcr}x glibc after 1000 dead threads - magazines leaking?"
 fi
 
+# The span cache, measured from outside. "Freed large mappings are kept and
+# reused" is a claim about syscalls, and nothing in a program's own output can
+# see it, so strace counts them. 200 alloc/free cycles of one large size:
+# without the cache that is 200 munmaps for the frees plus two trimming
+# munmaps per map_aligned, and it measured 601. With it, 3.
+#
+# glibc's number is printed alongside and asserted small too, because if the
+# workload were wrong -- a size that never reached the large path, say -- both
+# would be near zero and the assertion would pass for nothing.
+if command -v strace >/dev/null 2>&1; then
+	cc -O1 -o "$T/bigloop" t/bigloop.c 2>/dev/null || {
+		bad "could not build t/bigloop.c"; }
+	if [ -x "$T/bigloop" ]; then
+		mu() { LD_PRELOAD="$1" strace -c -e trace=munmap "$T/bigloop" 200 2>&1 \
+		       >/dev/null | awk '$NF=="munmap"{print $4}'; }
+		ours=$(mu "$SLAB"); ours=${ours:-0}
+		theirs=$(LD_PRELOAD= strace -c -e trace=munmap "$T/bigloop" 200 2>&1 \
+		         >/dev/null | awk '$NF=="munmap"{print $4}'); theirs=${theirs:-0}
+		if [ "$theirs" -gt 20 ]; then
+			bad "span cache: glibc made $theirs munmaps, so the workload is wrong"
+		elif [ "$ours" -le 20 ]; then
+			ok "span cache: 200 large cycles cost $ours munmaps (glibc $theirs)"
+		else
+			bad "span cache: 200 large cycles cost $ours munmaps, want <= 20 (glibc $theirs)"
+		fi
+	fi
+else
+	printf 'SKIP span cache munmap count (strace not installed)\n'
+fi
+
 # ---------------------------------------------------------------- tier 3
 # Does tier 2 have teeth?  Build deliberately broken slabs and require the
 # oracle to reject each one.  A suite that cannot fail is not a suite, and
