@@ -88,7 +88,7 @@ ok    self-check: 'stress check' rejects a calloc that never zeroes
 ok    self-check: 'stress check' rejects a realloc that copies half the bytes
 ok    self-check: 'stress check' rejects a class index one too small for one octave
 
-31 passed, 0 failed
+32 passed, 0 failed
 ```
 
 ### What the oracle caught
@@ -146,8 +146,13 @@ With the hardening in place all six mutants are caught:
 | `realloc` copies half the bytes | `realloc 101 -> 128 lost content` |
 | objects overlap by 8 bytes | pattern mismatch within 81 iterations |
 
-Four of the six are permanent fixtures of `make test` (tier 3); the other two
-were one-off probes.
+**Five** are permanent fixtures of `make test` (tier 3) and the suite prints
+one `self-check:` line per mutant, so the count is in the output:
+`objects overlap by 8 bytes`, `calloc never zeroes`, `realloc copies half the
+bytes`, `a class index one too small for one octave`, and the hand-built
+`magazines with no adoption`, which is checked by RSS rather than by
+`stress check` and so is not in the table above. This said "four of the six"
+and counted only the four `mutant` calls, missing the no-adoption one.
 
 ## Benchmarks
 
@@ -408,7 +413,47 @@ possible to hand a dead thread's magazines to a live one instead of losing the
 objects on them. See "What does not work" for where that stops.
 
 Deliberate shortcuts are marked `shortcut:` in `slab.c`, each naming the
-ceiling it imposes and the upgrade path out of it. There are five.
+ceiling it imposes and the upgrade path out of it. There are seven.
+
+## The suite was green on a library that interposes nothing
+
+Everything in tiers 1 and 2 is satisfied by a shared object that loads
+cleanly and provides no `malloc` at all. Verified by building one --
+`gcc -shared -fPIC` over a file containing a single unused variable, copied
+over `libslab.so`:
+
+```
+31 passed, 0 failed
+```
+
+The whole suite, green, on a functionless library. The mechanism is that
+every tier-1 check compares a command's output **with and without**
+`LD_PRELOAD` and requires them to match, tier 2 runs `t/stress` under
+preload and requires exit 0, and the suite separately requires both to also
+pass against glibc malloc -- because an oracle glibc fails is a wrong
+oracle, which is correct reasoning that happens to make "nothing was
+replaced" indistinguishable from "the replacement works". The RSS ratios
+came out near 1.00 against limits of 3.0 and 1.5, the munmap counts matched
+because both sides were glibc, and tier 3's mutants are compiled from
+`slab.c` rather than from the `.so`, so they could not notice either.
+
+The suite now starts by asking whether `LD_PRELOAD` changed anything:
+
+```
+ok    interposition: LD_PRELOAD replaces malloc (usable(malloc(1)) 24 -> 16)
+```
+
+`malloc_usable_size` is the cheapest observable that separates them --
+slab's header is 16 bytes for a 1-byte request where this glibc's is 24 --
+and the two values are **compared rather than pinned**, so the check
+survives a libc whose own answer differs. With the empty library in place it
+now reads:
+
+```
+FAIL  interposition: LD_PRELOAD changes nothing
+      malloc_usable_size(malloc(1)) is 24 either way -- libslab.so is not
+      providing malloc, and every check below passes anyway
+```
 
 ## License
 

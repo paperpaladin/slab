@@ -614,6 +614,38 @@ int main(int argc, char **argv)
 	const char *mode = argc > 1 ? argv[1] : "check";
 	long n = argc > 2 ? atol(argv[2]) : 0;
 
+	/* Is the allocator under test actually ours?
+	 *
+	 * NOTHING ELSE IN THIS SUITE ASKS. Tier 1 compares a command's output
+	 * with and against LD_PRELOAD and demands they match; tier 2 runs this
+	 * binary under preload and demands exit 0; and the suite separately
+	 * REQUIRES that both also pass against glibc malloc, because an oracle
+	 * that glibc fails is a wrong oracle. All three are satisfied by a
+	 * shared object that loads cleanly and defines no malloc at all.
+	 *
+	 * Verified by building one: `gcc -shared -fPIC` over a file containing
+	 * a single unused variable, copied over libslab.so, gives
+	 *
+	 *     31 passed, 0 failed
+	 *
+	 * The RSS ratios come out at about 1.00 against limits of 3.0 and 1.5,
+	 * the munmap counts match because both sides are glibc, and tier 3's
+	 * mutants are compiled from slab.c rather than from the .so, so they
+	 * cannot notice either. The whole suite was green on a functionless
+	 * library.
+	 *
+	 * malloc_usable_size is the cheapest observable that separates them:
+	 * slab's header is 16 bytes for a 1-byte request where glibc's is 24.
+	 * The number is not asserted here -- `interposed` prints it and
+	 * t/run.sh compares the preloaded value against the un-preloaded one,
+	 * so the check survives a libc whose own answer is different. */
+	if (!strcmp(mode, "interposed")) {
+		void *p = malloc(1);
+		printf("%zu\n", malloc_usable_size(p));
+		free(p);
+		return 0;
+	}
+
 	if (!strcmp(mode, "check")) {
 		check_free_null();
 		check_alignment();

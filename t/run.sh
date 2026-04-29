@@ -47,6 +47,36 @@ PY
 
 # same <name> <shell command>: run it with and without the preload and
 # demand identical bytes out of both.
+# ------------------------------------------------- is slab even loaded?
+#
+# This runs FIRST because every other check in the file is satisfied by a
+# shared object that loads cleanly and interposes nothing. Verified by
+# building one -- `gcc -shared -fPIC` over a single unused variable, copied
+# over libslab.so -- which gives "31 passed, 0 failed" on this suite.
+#
+# tier 1 compares a command's output with and without LD_PRELOAD and demands
+# they match; tier 2 runs t/stress under preload and demands exit 0; and the
+# suite separately requires both to pass against glibc malloc, because an
+# oracle glibc fails is a wrong oracle. All three hold when nothing is
+# interposed. The RSS ratios come out near 1.00 against limits of 3.0 and
+# 1.5, the munmap counts match because both sides are glibc, and tier 3's
+# mutants are built from slab.c rather than from the .so.
+#
+# The two values are COMPARED rather than pinned: slab's header is 16 bytes
+# for a 1-byte request and this glibc's is 24, but another libc may answer
+# differently and the property is "ours is not theirs".
+g_usable=$(./t/stress interposed 2>/dev/null)
+s_usable=$(LD_PRELOAD="$SLAB" ./t/stress interposed 2>/dev/null)
+if [ -z "$s_usable" ] || [ -z "$g_usable" ]; then
+	bad "interposition: could not read malloc_usable_size" \
+	    "glibc='$g_usable' slab='$s_usable'"
+elif [ "$s_usable" = "$g_usable" ]; then
+	bad "interposition: LD_PRELOAD changes nothing" \
+	    "malloc_usable_size(malloc(1)) is $g_usable either way -- $SLAB is not providing malloc, and every check below passes anyway"
+else
+	ok "interposition: LD_PRELOAD replaces malloc (usable(malloc(1)) $g_usable -> $s_usable)"
+fi
+
 same() {
 	name=$1
 	cmd=$2
