@@ -257,9 +257,24 @@ static void check_realloc(void)
 
 static void check_free_null(void)
 {
+	/* CHECK(1, ...) cannot fail, and said so in the count. The real test
+	 * is that the two free(NULL) calls above do not abort -- reaching this
+	 * line IS the result -- but an assertion whose condition is the
+	 * literal 1 inflates the check count without adding a check. Allocate
+	 * after them instead: a free(NULL) that corrupted the allocator shows
+	 * up as the next malloc failing or returning something unusable. */
+	void *p;
+
 	free(NULL);
 	free(NULL);
-	CHECK(1, "free(NULL) survived");
+	p = malloc(32);
+	CHECK(p != NULL, "free(NULL) left the allocator usable");
+	if (p) {
+		memset(p, 0xab, 32);
+		CHECK(((unsigned char *)p)[31] == 0xab,
+		      "...and the block it then returned is writable");
+		free(p);
+	}
 }
 
 static void check_memalign(void)

@@ -80,9 +80,18 @@ Ranked by how much it would embarrass us to fail it.
 6. **The oracle checked against glibc.** The same stress and semantic tests
    run against glibc `malloc`. If they fail there, the test is wrong, not
    slab.
+6b. **LD_PRELOAD interposition, checked first.** `malloc_usable_size(malloc(1))`
+   is compared with and without the preload, before any allocator behaviour is
+   asserted. Without it the entire suite was green against a library that
+   defines no `malloc`: a `libslab.so` built from one unused variable passes
+   31 of the 32 checks, including the RSS ratios, the span-cache munmap count
+   and all five mutants. This was missing from the Oracle list entirely, and
+   it is the one check everything else depends on.
+
 7. **Mutation self-check.** `make test` builds five deliberately broken
    slabs -- overlapping objects, a `calloc` that never zeroes, a `realloc`
-   that copies half the bytes, a class index one too small for one octave --
+   that copies half the bytes, a class index one too small for one octave,
+   and magazines with no adoption (this list named four of the five) --
    and requires each to be rejected *by the check that owns that behaviour*,
    not merely by some check somewhere. A suite that cannot fail is not a
    suite, and this is not hypothetical: it is how we found that gcc was
@@ -148,7 +157,8 @@ Ranked by how much it would embarrass us to fail it.
         cross-thread free is the case a per-thread cache would get wrong.
 - [x] t/run.sh: run the oracle against glibc, and measure the footprint
       - why: guards against the suite drifting into a description of slab;
-        and turns "peak RSS is sticky" from an assertion into 1.08x.
+        and turns "peak RSS is sticky" from an assertion into a measurement
+        -- 1.10x on the churn workload, measured twice.
 - [x] t/run.sh: mutation self-check - RED, it indicts the oracle
       - why: `make test` fails at this commit on purpose.  A slab whose
         calloc never zeroes passes the targeted calloc check, because gcc
@@ -184,7 +194,8 @@ Ranked by how much it would embarrass us to fail it.
         pthread_key_create's destructor is the usual answer and is ruled out
         because pthread_setspecific allocates. New thread-churn test: 1000
         threads created and joined one at a time, peak RSS 1.00x glibc, and
-        17x with the adoption removed. Keeping half the magazine on a drain
+        about 10.5x with the adoption removed (10.47x, 10.53x, 10.58x over
+        three runs; this said 17x). Keeping half the magazine on a drain
         was implemented, measured, found to be inside the noise on all five
         benchmarks, and deleted.
 - [x] A free-span cache for large allocations: keep recently freed large
