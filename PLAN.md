@@ -61,7 +61,7 @@ Ranked by how much it would embarrass us to fail it.
    `malloc`/`calloc`/`posix_memalign`/`realloc`/`free` over 2048 live slots,
    with each block filled with a pattern derived from a unique tag and
    verified on every subsequent touch. This is the only thing that reliably
-   catches overlapping allocations, which is the bug that matters most
+   catches overlapping allocations, the bug that matters most
    because it corrupts silently and far from its cause.
 3. The direct no-overlap test. Hold 30 000 live blocks of every
    interesting size at once, sort them by address, assert no block's payload
@@ -73,7 +73,7 @@ Ranked by how much it would embarrass us to fail it.
 5. Semantic conformance. Alignment of every size from 0 to 4096 plus
    large and over-aligned cases; `posix_memalign` from 8 bytes to 4 MiB of
    alignment including the `EINVAL` cases; `calloc` zeroing *after
-   dirtying and freeing the same block*, which is what catches an allocator
+   dirtying and freeing the same block*, and that is what catches an allocator
    that only zeroes fresh pages; `realloc` content preservation across every
    class boundary in both directions; `free(NULL)`; `malloc(0)`;
    out-of-range sizes returning `NULL`.
@@ -187,7 +187,7 @@ Ranked by how much it would embarrass us to fail it.
       - done: 20.8x -> 1.2x, measured against the previous commit in the same
         sitting; the other four benchmark rows did not move. The TLS the
         feature needs is one eight-byte pointer with tls_model
-        initial-exec, which is the only model that cannot reach malloc
+        initial-exec, the only model that cannot reach malloc
         through __tls_get_addr. The magazines live in our own memory with a
         registry that outlives every thread, and a dead thread's set is
         adopted by the next thread to ask, tested with tgkill(tid, 0),
