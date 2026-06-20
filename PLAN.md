@@ -42,7 +42,7 @@ every test in the oracle exists to attack one of them:
   offset 64, and every class size is a multiple of 16, so every object
   offset within a span is a multiple of 16. The `_Static_assert`s on
   `HDR % 16` and `sizeof(struct hdr) <= HDR` are the part a compiler can
-  check. The class table being all multiples of 16 is checked by the oracle.
+  check. Class sizes being all multiples of 16 is checked by the oracle.
 
 Over-aligned requests leave the size classes entirely and get a dedicated
 mapping, so they cannot weaken either half.
@@ -77,8 +77,7 @@ Ranked by how much it would embarrass us to fail it.
    that only zeroes fresh pages; `realloc` content preservation across every
    class boundary in both directions; `free(NULL)`; `malloc(0)`;
    out-of-range sizes returning `NULL`.
-6. The oracle checked against glibc. The same stress and semantic tests
-   run against glibc `malloc`. If they fail there, the test is wrong, not
+6. The oracle checked against glibc. Those same stress and semantic tests run against glibc `malloc`. If they fail there, the test is wrong, not
    slab.
 6b. LD_PRELOAD interposition, checked first. `malloc_usable_size(malloc(1))`
    is compared with and without the preload, before any allocator behaviour is
