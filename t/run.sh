@@ -171,6 +171,23 @@ unit() {
 
 unit "semantics (alignment, calloc, realloc, memalign, no-overlap)" \
 	./t/stress check
+# The reserved PROT_NONE tail.  This mode is the one slab-specific thing in
+# t/stress: it asserts that realloc grows a large block WITHOUT MOVING IT
+# (same pointer), that the kernel reports the tail as ---p in
+# /proc/self/maps, that writing one byte past the block kills a forked child
+# with SIGSEGV, and that freeing a grown block puts it back to the size the
+# span cache can match.
+unit "guard: large blocks grow in place, and the tail faults" \
+	./t/stress guard
+# ... and the same mode against glibc, where every one of its assertions is
+# expected to FAIL.  That is the teeth check: a guard assertion that glibc
+# also satisfied would be testing the C library, not the reservation.
+if ./t/stress guard >"$T/gg.out" 2>&1; then
+	bad "guard: glibc malloc passes it, so it is not testing slab's reservation"
+else
+	ok "guard: glibc fails $(grep -c '^  FAIL' "$T/gg.out") of its assertions, so none of them is free"
+fi
+
 unit "stress: 3M random ops, byte pattern verified"  ./t/stress stress 3000000
 unit "stress: 4 threads, 400k ops each, cross-thread free" \
 	./t/stress thread 400000
@@ -285,6 +302,28 @@ if command -v strace >/dev/null 2>&1; then
 		else
 			bad "span cache: 200 large cycles cost $ours munmaps, want <= 20 (glibc $theirs)"
 		fi
+
+		# Growth in place is a syscall claim too, and the bound below has
+		# teeth against a specific regression rather than against the
+		# feature.  200 rounds of a doubling chain cost 13 mmaps and 3
+		# munmaps with the reservation, and 16 and 9 before it existed, so
+		# the mmap count is NOT what the reservation improves -- the span
+		# cache already handled this shape.  What it catches is the thing
+		# that broke when the reservation was first written: a grown
+		# mapping went into the span cache at its grown size, nothing ever
+		# matched it again, and the same loop measured 214 mmaps and 587
+		# munmaps.  big_shrink() is why it does not.
+		gours=$(LD_PRELOAD="$SLAB" strace -c -e trace=mmap,munmap \
+			"$T/bigloop" 200 g 2>&1 >/dev/null \
+			| awk '$NF=="mmap"||$NF=="munmap"{n+=$4} END{print n+0}')
+		gtheirs=$(LD_PRELOAD= strace -c -e trace=mmap,munmap \
+			"$T/bigloop" 200 g 2>&1 >/dev/null \
+			| awk '$NF=="mmap"||$NF=="munmap"{n+=$4} END{print n+0}')
+		if [ "$gours" -le 60 ]; then
+			ok "grow loop: 200 doubling chains cost $gours mmap+munmap (glibc $gtheirs)"
+		else
+			bad "grow loop: 200 doubling chains cost $gours mmap+munmap, want <= 60 (glibc $gtheirs) - is a grown mapping going into the span cache at its grown size?"
+		fi
 	fi
 else
 	# Counted, not just printed: this is the one skippable check and the
@@ -310,17 +349,38 @@ fi
 MUT="-std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-calloc
      -fno-builtin-realloc -fno-builtin-free"
 
+# A mutant that does not interpose is a mutant that fails everything for the
+# wrong reason, and the sed expressions here are the easiest way to produce
+# one by accident: `|` is both the delimiter and a C operator, so an
+# expression containing PROT_READ | PROT_WRITE makes sed exit 1 and leave
+# "$T/mut.c" EMPTY. An empty file compiles cleanly into a shared object with
+# no malloc in it, `cmp -s` says it differs from slab.c, and every mode
+# "rejects" it. That happened while these five were being written and read as
+# four confirmations. So: sed's exit status is checked, and the built library
+# has to change malloc_usable_size(malloc(1)) the way libslab.so does.
 mutant() {
 	name=$1
 	mode=$2
 	expr=$3
-	sed "$expr" slab.c >"$T/mut.c"
+	if ! sed "$expr" slab.c >"$T/mut.c"; then
+		bad "self-check $name: sed failed (delimiter clash in the expression?)"
+		return
+	fi
 	if cmp -s "$T/mut.c" slab.c; then
 		bad "self-check $name: sed did not apply (slab.c changed shape)"
-	elif ! gcc $MUT -o "$T/mut.so" "$T/mut.c" 2>"$T/m.err"; then
+		return
+	fi
+	if ! gcc $MUT -o "$T/mut.so" "$T/mut.c" 2>"$T/m.err"; then
 		bad "self-check $name: mutant did not compile"
 		head -2 "$T/m.err" | sed 's/^/        /'
-	elif LD_PRELOAD="$T/mut.so" ./t/stress $mode >/dev/null 2>&1; then
+		return
+	fi
+	_mu=$(LD_PRELOAD="$T/mut.so" ./t/stress interposed 2>/dev/null)
+	if [ -z "$_mu" ] || [ "$_mu" = "$g_usable" ]; then
+		bad "self-check $name: the mutant does not interpose malloc (usable=$_mu, glibc=$g_usable), so rejecting it proves nothing"
+		return
+	fi
+	if LD_PRELOAD="$T/mut.so" ./t/stress $mode >/dev/null 2>&1; then
 		bad "self-check: 'stress $mode' ACCEPTED $name"
 	else
 		ok "self-check: 'stress $mode' rejects $name"
@@ -335,6 +395,19 @@ mutant "a realloc that copies half the bytes" "check" \
 	's|\tmemcpy(q, p, old < size ? old : size);|\tmemcpy(q, p, (old < size ? old : size) / 2);|'
 mutant "a class index one too small for one octave" "check" \
 	's|>> (b - 2));|>> (b - 2)) - (b == 5);|'
+
+# The reserved tail, five ways.  Note the delimiters: the first and second
+# expressions have to use @ because the code they match contains `|`.
+mutant "a realloc that moves a large block instead of growing it" "guard" \
+	's@\tif (want <= h->commit || want > h->map_len)@\tif (1)@'
+mutant "a reserved tail that is mapped writable instead of PROT_NONE" "guard" \
+	's@base = map_aligned(commit + tail, PROT_NONE);@base = map_aligned(commit + tail, PROT_READ | PROT_WRITE);@'
+mutant "a reservation that is never taken" "guard" \
+	's|\tif (commit < RESERVE_MIN)|\tif (1)|'
+mutant "a grown block that keeps its grown size when freed" "guard" \
+	's|\t\tif (h->commit > h->commit0)|\t\tif (0)|'
+mutant "a shrink that drops the pages but leaves the tail writable" "guard" \
+	's|\tif (mprotect(from, n, PROT_NONE) == 0)|\tif (1)|'
 
 # The two RSS limits are measurements rather than exit statuses, so `mutant`
 # cannot drive them: an allocator that leaks a megabyte per dead thread still

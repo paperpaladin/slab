@@ -17,7 +17,7 @@
  * back per dead thread -- which is what a per-thread cache gets wrong when
  * the cache dies with its thread and the objects on it become unreachable.
  *
- * Mode `bench`: timing, printed as "name ns/op".  Five phases chosen to
+ * Mode `bench`: timing, printed as "name ns/op".  Six phases chosen to
  * separate where slab is competitive from where it is not.
  *
  * Mode `check`: semantic conformance.  Alignment of every size from 0 to
@@ -39,8 +39,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -485,6 +488,148 @@ static void *worker(void *arg)
 	return NULL;
 }
 
+/* ---------------- guard mode ----------------
+ *
+ * SLAB-SPECIFIC, and the only mode here that is.  Everything above is an
+ * oracle that glibc also has to pass; this asks three questions that are
+ * about slab's reserved PROT_NONE tail and nothing else, so t/run.sh runs it
+ * under the preload only and no claim is made about any other allocator.
+ *
+ * 1. Did growth happen WHERE THE BLOCK ALREADY WAS?  realloc returning the
+ *    same pointer for a large block that quadrupled is the observable, and
+ *    it is here because a reservation that is never actually grown into is
+ *    invisible in every other check: the suite would pass with mprotect
+ *    deleted and realloc copying as before.
+ * 2. Is the tail really unreadable?  Asked of the kernel twice over: once
+ *    by reading the permissions back out of /proc/self/maps, and once by
+ *    writing a byte past the end of the block in a forked child and
+ *    requiring that child to die of SIGSEGV.  mprotect returning 0 is not
+ *    evidence; a fault is.
+ * 3. Does a grown block go back to its natural size when freed?  The span
+ *    cache matches on that size, so without the restore a buffer that is
+ *    malloc'd small and doubled is never reused, which measured as 200
+ *    fresh mmaps where there had been none.  Observable as: free a grown
+ *    block, ask for the original size again, get the same address, the same
+ *    usable size, and a tail that faults again.
+ */
+
+/* Write one byte at p[off] in a child process and report how it died.
+ * Returns the signal, or 0 if the child survived the write. */
+static int fault_on_write(volatile unsigned char *p, size_t off)
+{
+	fflush(NULL);                /* no buffered output duplicated by fork */
+	pid_t c = fork();
+	if (c == 0) {
+		p[off] = 0x5a;
+		_exit(0);            /* the write was allowed: that is the bug */
+	}
+	int st = 0;
+	if (c < 0 || waitpid(c, &st, 0) != c)
+		return -1;
+	return WIFSIGNALED(st) ? WTERMSIG(st) : 0;
+}
+
+/* Permissions the kernel reports for the mapping that starts at `addr`, or
+ * NULL if no mapping starts exactly there. */
+static int maps_perms_at(unsigned long addr, char out[5])
+{
+	FILE *f = fopen("/proc/self/maps", "r");
+	char line[512];
+	int found = 0;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		unsigned long a, b;
+		char perms[8];
+		if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3)
+			continue;
+		if (a == addr) {
+			memcpy(out, perms, 4);
+			out[4] = 0;
+			found = 1;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+static void check_guard(void)
+{
+	/* Above RESERVE_MIN in slab.c, so this block gets a reserved tail.
+	 * A value that is not a round number of pages on purpose: the tail
+	 * starts at the page boundary past the payload, not at the payload. */
+	const size_t n = 300000;
+	unsigned char *p = launder(malloc(n));
+	CHECK(p != NULL, "malloc(%zu)", n);
+	if (!p)
+		return;
+	size_t up = malloc_usable_size(p);
+	CHECK(up >= n, "usable %zu < requested %zu", up, n);
+	fill(p, 0x1234, n);
+
+	/* (2a) the kernel's own account of the tail */
+	char perms[5] = "????";
+	int got = maps_perms_at((unsigned long)p + up, perms);
+	CHECK(got, "no mapping starts at the end of the payload (%p + %zu)",
+	      (void *)p, up);
+	CHECK(got && !strcmp(perms, "---p"),
+	      "tail mapping at %p is %s, wanted ---p", (void *)(p + up), perms);
+
+	/* (2b) and what the hardware does about it */
+	int sig = fault_on_write(p, up);
+	CHECK(sig == SIGSEGV, "writing p[%zu], one byte past the block, died of "
+	      "signal %d, wanted SIGSEGV (%d)", up, sig, SIGSEGV);
+
+	/* (1) growth in place: same address, content kept, more room */
+	unsigned char *q = launder(realloc(p, 4 * n));
+	CHECK(q != NULL, "realloc(p, %zu)", 4 * n);
+	if (!q)
+		return;
+	CHECK(q == p, "realloc grew %zu -> %zu by moving the block (%p -> %p), "
+	      "so the reservation was not used", n, 4 * n, (void *)p, (void *)q);
+	CHECK(verify(q, 0x1234, n), "content lost growing in place");
+	size_t uq = malloc_usable_size(q);
+	CHECK(uq >= 4 * n, "usable after growth %zu < %zu", uq, 4 * n);
+
+	/* the guard moved up with the end of the block */
+	sig = fault_on_write(q, uq);
+	CHECK(sig == SIGSEGV, "after growing, writing q[%zu] died of signal %d, "
+	      "wanted SIGSEGV", uq, sig);
+
+	/* (3) freed at four times its natural size, reusable at its natural
+	 * size, with the guard back where it started */
+	free(q);
+	unsigned char *r = launder(malloc(n));
+	CHECK(r != NULL, "malloc(%zu) after the grown block was freed", n);
+	if (!r)
+		return;
+	CHECK(r == p, "the grown mapping was not recycled for an equal request "
+	      "(%p, wanted %p): freeing it did not restore its natural size",
+	      (void *)r, (void *)p);
+	size_t ur = malloc_usable_size(r);
+	CHECK(ur == up, "recycled block reports %zu usable bytes, wanted the "
+	      "original %zu", ur, up);
+	sig = fault_on_write(r, ur);
+	CHECK(sig == SIGSEGV, "after the grown block was freed and re-taken, "
+	      "writing r[%zu] died of signal %d, wanted SIGSEGV", ur, sig);
+	free(r);
+
+	/* A large block too small for a reservation still ends where it says
+	 * it ends: there is no tail, so one byte past it is simply unmapped. */
+	const size_t m = 20000;
+	unsigned char *t = launder(malloc(m));
+	CHECK(t != NULL, "malloc(%zu)", m);
+	if (!t)
+		return;
+	size_t ut = malloc_usable_size(t);
+	sig = fault_on_write(t, ut);
+	CHECK(sig == SIGSEGV, "unreserved large block: writing t[%zu] died of "
+	      "signal %d, wanted SIGSEGV", ut, sig);
+	free(t);
+}
+
 /* ---------------- bench mode ---------------- */
 
 static double now(void)
@@ -550,6 +695,35 @@ static void bench_grow(long iters)
 		free(p);
 	}
 	report("realloc-grow", now() - t0, ops);
+}
+
+/*
+ * Growing a large buffer by doubling, 16 KiB up to 4 MiB.
+ *
+ * bench_grow above stops at 64 KiB, so only two of its thirteen steps are
+ * large-to-large; this one is eight out of eight, which is the case a
+ * grow-in-place reservation exists for.  Only the last byte of each size is
+ * touched, so the number is allocator work rather than the cost of filling
+ * a buffer.
+ */
+static void bench_biggrow(long iters)
+{
+	double t0 = now();
+	long ops = 0;
+	for (long i = 0; i < iters; i++) {
+		size_t n = 16384;
+		char *p = malloc(n);
+		p[n - 1] = 1;
+		while (n < 4u * 1024 * 1024) {
+			size_t m = n * 2;
+			p = realloc(p, m);
+			p[m - 1] = 1;
+			n = m;
+			ops++;
+		}
+		free(p);
+	}
+	report("large-grow", now() - t0, ops);
 }
 
 static void bench_large(long iters)
@@ -661,7 +835,9 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	if (!strcmp(mode, "check")) {
+	if (!strcmp(mode, "guard")) {
+		check_guard();
+	} else if (!strcmp(mode, "check")) {
 		check_free_null();
 		check_alignment();
 		check_calloc();
@@ -703,12 +879,13 @@ int main(int argc, char **argv)
 		bench_small(it);
 		bench_mixed(it / 4);
 		bench_grow(it / 200);
+		bench_biggrow(it / 20000 ? it / 20000 : 1);
 		bench_large(it / 500);
 		bench_threads(it / 4, 4);
 		return 0;
 	} else {
 		fprintf(stderr,
-			"usage: stress check|stress|thread|tchurn|bench [n]\n");
+			"usage: stress check|guard|stress|thread|tchurn|bench [n]\n");
 		return 2;
 	}
 

@@ -33,6 +33,30 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	/* Grow mode: a doubling chain from BIGLOOP_SIZE, n times.  Drives the
+	 * harness's mmap count for growth in place, which is the same kind of
+	 * claim as the one above and just as invisible from inside: a realloc
+	 * that moves a large block maps a new one, a realloc that commits part
+	 * of a reservation it already holds does not. */
+	if (argc > 2 && argv[2][0] == 'g') {
+		for (long i = 0; i < n; i++) {
+			size_t sz = BIGLOOP_SIZE;
+			char *p = malloc(sz);
+			if (!p)
+				return 1;
+			p[sz - 1] = 0x5a;
+			for (int k = 0; k < 3; k++) {
+				sz *= 2;
+				p = realloc(p, sz);
+				if (!p)
+					return 1;
+				p[sz - 1] = 0x5a;
+			}
+			free(p);
+		}
+		return 0;
+	}
+
 	for (long i = 0; i < n; i++) {
 		void *p = malloc(BIGLOOP_SIZE);
 		if (!p)

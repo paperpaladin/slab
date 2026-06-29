@@ -23,12 +23,13 @@
  * configuration, no __thread variables (the first access to a dynamic-TLS
  * variable can call __tls_get_addr -> dlopen bookkeeping -> malloc -> us,
  * recursively), no pthread_once, no atexit.  The only libc calls here are
- * mmap, munmap, memcpy, memset, write, strlen and sched_yield, none of
- * which allocate (plus gettid and tgkill, reached through syscall(2) because
- * glibc's wrappers for them are recent).  There is also no initialisation step at all: every table
- * below is either a compile-time constant or computed arithmetically, so
- * there is no "am I initialised yet" flag to race on and no init
- * re-entrancy window.
+ * mmap, munmap, mprotect, madvise, memcpy, memset, write, strlen and
+ * sched_yield,
+ * none of which allocate (plus gettid and tgkill, reached through syscall(2)
+ * because glibc wrappers for them are recent).  There is also no
+ * initialisation step at all: every table below is either a compile-time
+ * constant or computed arithmetically, so there is no "am I initialised
+ * yet" flag to race on and no init re-entrancy window.
  */
 
 #define _GNU_SOURCE
@@ -87,7 +88,9 @@ struct hdr {
 	uint32_t bump;       /* small: offset of next never-used object */
 	uint32_t cap;        /* small: offset one past the last object */
 	void    *map_base;   /* large: what to hand back to munmap */
-	size_t   map_len;    /* large: how much */
+	size_t   map_len;    /* large: how much, reserved tail included */
+	size_t   commit;     /* large: bytes of map_len that are readable/writable */
+	size_t   commit0;    /* large: the commit it was mapped with; see big_shrink */
 	size_t   req;        /* large: usable payload bytes */
 };
 _Static_assert(sizeof(struct hdr) <= HDR, "span header must fit in HDR bytes");
@@ -109,11 +112,17 @@ static char  *arena_cur, *arena_end;
  * every block was faulted in from zero. glibc keeps freed blocks and hands
  * them back. This does the same, for the plain-large path only.
  *
- * Matched on exact length. Large requests are rounded up to a page, so lengths
- * cluster hard in practice, and exact matching keeps the lookup a short scan
- * with no policy to get wrong. shortcut: a best-fit or size-class match would
- * hit more often on a workload whose sizes drift; the ceiling is that a program
- * cycling through many distinct sizes gets no reuse at all.
+ * Matched by best fit within 25%, on the COMMITTED size of the entry rather
+ * than on its whole length: the difference between the two is the PROT_NONE
+ * reservation described below, which is address space and not memory, so
+ * matching on it would turn a 128 KiB request into a 4 MiB one.  Exact
+ * matching is the obvious design and was tried; it moved large-churn by 2%,
+ * because that benchmark picks random sizes and page-rounding still leaves
+ * about 250 distinct lengths for a 16-entry cache to miss.
+ *
+ * A mapping that a realloc grew is restored to the size it was mapped with
+ * before it goes in here; see big_shrink().  Without that the matching above
+ * never fires for the one workload the reservation exists for.
  *
  * Only the plain path is cached. The over-aligned path (align >= SPAN_SIZE)
  * has a different geometry -- the header sits a whole span below a payload that
@@ -127,9 +136,79 @@ static char  *arena_cur, *arena_end;
 #define SPANCACHE_N     16
 #define SPANCACHE_BYTES (64u * 1024u * 1024u)
 
-static struct { void *base; size_t len; } spancache[SPANCACHE_N];
+/* `commit` is what the entry costs the process; `len` is what munmap needs.
+ * The byte bound below is on commit, because the difference between them is
+ * PROT_NONE address space and not memory anybody paid for. */
+static struct { void *base; size_t len, commit; } spancache[SPANCACHE_N];
 static int    nspan;
 static size_t spanbytes;
+
+/*
+ * THE RESERVED TAIL, which is what makes realloc() grow without copying.
+ *
+ * A large block is one mmap.  Doubling it used to mean a second mmap, a
+ * memcpy of the whole thing and an munmap, and the memcpy is the cheap part:
+ * the destination has to be faulted in page by page, so growing 16 KiB to
+ * 4 MiB by doubling faulted about 2048 pages and copied 8 MiB.  glibc calls
+ * mremap and the kernel edits a page table instead.
+ *
+ * mremap is not available to us.  MREMAP_MAYMOVE can return an address that
+ * is not SPAN_SIZE-aligned, and the AND-mask header lookup depends on that
+ * alignment; without MREMAP_MAYMOVE it fails whenever the next page is
+ * taken, which on a busy heap is most of the time.
+ *
+ * So the space is reserved up front.  Each large mapping is RESERVE_K + 1
+ * times the size it needs, and everything past the part in use is mapped
+ * PROT_NONE: no pages, no RSS, no overcommit charge (the kernel only
+ * accounts a private anonymous mapping that is writable), and a hard fault
+ * for anybody who runs off the end of the block.  Growth is one mprotect.
+ *
+ * Both constants are measurements, and the README has the tables.
+ *
+ * RESERVE_MIN is a floor because the mprotect pair is not free: with no
+ * floor at all the realloc-grow benchmark, whose chain stops at 64 KiB, went
+ * from 151 ns/op to 638, since at those sizes the copy comes out of a span
+ * cache mapping whose pages are already warm and costs less than two
+ * syscalls.  Measured floors: 1 -> 638, 16 KiB -> 677, 32 KiB -> 533,
+ * 64 KiB -> 155, 128 KiB -> 151.
+ *
+ * RESERVE_K = 31 means a buffer can double five times before it has to move.
+ * The large-grow benchmark is bimodal in this constant rather than smooth,
+ * because its chain spans exactly 32x from the first reserved block, so 31
+ * is the smallest value that makes it copy-free (2.3 us/op at 31 and 63,
+ * 62 us at 15, 120 us at 7).  The law to trust is the general one: one copy
+ * every log2(K+1) doublings.
+ *
+ * shortcut: the reservation is a fixed multiple, so a block that grows past
+ * it still pays one copy, and a block at or above RESERVE_MIN that never
+ * grows pays one extra mprotect and one extra VMA.  Ceilings: address space,
+ * measured at VmPeak 34 MB -> 996 MB on a workload holding 64 large blocks
+ * (VmHWM unchanged at 1648 kB); and a process holding more than about 32000
+ * live large blocks at once approaches the default vm.max_map_count, since
+ * each one is now two mappings instead of one.  Upgrade path: widen the
+ * reservation on each forced move, so a buffer that keeps doubling stops
+ * moving after the second time, which would remove the cliff above.
+ */
+#ifndef RESERVE_K
+#define RESERVE_K    31u
+#endif
+#ifndef RESERVE_MIN
+#define RESERVE_MIN  (128u * 1024u)
+#endif
+#define RESERVE_MAX  (64u * 1024u * 1024u)
+
+static size_t reserve_tail(size_t commit)
+{
+	size_t tail;
+
+	if (commit < RESERVE_MIN)
+		return 0;
+	tail = commit <= RESERVE_MAX / RESERVE_K ? commit * RESERVE_K
+						 : RESERVE_MAX;
+	if (commit > SIZE_MAX - tail - SPAN_SIZE - PAGE)
+		return 0;
+	return tail;
+}
 
 /*
  * One global spinlock, guarding the class free lists and the arena.  Threads
@@ -173,9 +252,9 @@ static size_t round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 /* mmap `len` (a whole number of pages) at a SPAN_SIZE-aligned address, by
  * over-mapping and trimming.  The two extra munmaps are paid once per arena
  * and once per large allocation, never on the small path. */
-static void *map_aligned(size_t len)
+static void *map_aligned(size_t len, int prot)
 {
-	void *r = mmap(NULL, len + SPAN_SIZE, PROT_READ | PROT_WRITE,
+	void *r = mmap(NULL, len + SPAN_SIZE, prot,
 		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (r == MAP_FAILED)
 		return NULL;
@@ -197,7 +276,7 @@ static void *map_aligned(size_t len)
 static struct hdr *span_new(unsigned cls)
 {
 	if (arena_cur == arena_end) {
-		char *a = map_aligned(ARENA_LEN);
+		char *a = map_aligned(ARENA_LEN, PROT_READ | PROT_WRITE);
 		if (!a)
 			return NULL;
 		arena_cur = a;
@@ -454,20 +533,22 @@ static void *small(unsigned cls, int *fresh)
  * held. The caller must treat the memory as dirty: it held someone else's data
  * a moment ago, which is why calloc gets told.
  */
-static void *spancache_take(size_t len, size_t *got)
+static void *spancache_take(size_t need, size_t *got_commit, size_t *got_len)
 {
 	int best = -1;
 	for (int i = 0; i < nspan; i++) {
-		if (spancache[i].len < len || spancache[i].len > len + len / 4)
+		if (spancache[i].commit < need ||
+		    spancache[i].commit > need + need / 4)
 			continue;
-		if (best < 0 || spancache[i].len < spancache[best].len)
+		if (best < 0 || spancache[i].commit < spancache[best].commit)
 			best = i;
 	}
 	if (best < 0)
 		return NULL;
 	void *base = spancache[best].base;
-	*got = spancache[best].len;
-	spanbytes -= spancache[best].len;
+	*got_commit = spancache[best].commit;
+	*got_len = spancache[best].len;
+	spanbytes -= spancache[best].commit;
 	spancache[best] = spancache[--nspan];
 	return base;
 }
@@ -481,11 +562,11 @@ static void *spancache_take(size_t len, size_t *got)
  * again. The cap is why `len > SPANCACHE_BYTES` is rejected outright rather
  * than evicting everything else to make room for it.
  */
-static int spancache_put(void *base, size_t len)
+static int spancache_put(void *base, size_t len, size_t commit)
 {
-	if (nspan == SPANCACHE_N || len > SPANCACHE_BYTES)
+	if (nspan == SPANCACHE_N || commit > SPANCACHE_BYTES)
 		return 0;
-	while (spanbytes + len > SPANCACHE_BYTES) {
+	while (spanbytes + commit > SPANCACHE_BYTES) {
 		/* Evict the oldest-ish entry. There is no LRU here and the order is
 		 * whatever the swap-with-last removal left behind; with sixteen
 		 * entries matched on exact size, a real policy would be more code
@@ -495,15 +576,16 @@ static int spancache_put(void *base, size_t len)
 		if (nspan == 0)
 			return 0;
 		void *old = spancache[0].base;
-		size_t olen = spancache[0].len;
+		size_t olen = spancache[0].len, ocommit = spancache[0].commit;
 		spancache[0] = spancache[--nspan];
-		spanbytes -= olen;
+		spanbytes -= ocommit;
 		munmap(old, olen);
 	}
 	spancache[nspan].base = base;
 	spancache[nspan].len = len;
+	spancache[nspan].commit = commit;
 	nspan++;
-	spanbytes += len;
+	spanbytes += commit;
 	return 1;
 }
 
@@ -533,20 +615,43 @@ static void *alloc_big(size_t size, size_t align, int *fresh)
 		h->cls = CLS_LARGE;
 		h->map_base = base;
 		h->map_len = len;
+		h->commit = len;  /* no reserved tail, so no room to grow into */
+		h->commit0 = len;
 		h->req = size;
 		h->cached = 0;    /* different geometry; never interchangeable */
 		return p;
 	}
 
 	off = align > HDR ? align : HDR;        /* align is a power of two */
-	len = round_up(off + size, PAGE);
-	size_t got = len;
-	base = spancache_take(len, &got);
+	size_t commit = round_up(off + size, PAGE);
+	size_t cached_commit, cached_len;
+	len = commit;
+	base = spancache_take(commit, &cached_commit, &cached_len);
 	if (base) {
-		*fresh = 0;
-		len = got;   /* we own all of it, and req below reflects that */
+		*fresh = 0;   /* dirty: it held somebody else's data a moment ago */
+		commit = cached_commit;   /* we own all of it; req reflects that */
+		len = cached_len;
 	} else {
-		base = map_aligned(len);
+		/* Below RESERVE_MIN there is no tail, and the mapping is made
+		 * read-write in one syscall, exactly as it was before any of
+		 * this existed.  The mprotect pair is only worth paying where
+		 * the copy it avoids is worth more. */
+		size_t tail = reserve_tail(commit);
+		if (!tail) {
+			base = map_aligned(commit, PROT_READ | PROT_WRITE);
+		} else {
+			base = map_aligned(commit + tail, PROT_NONE);
+			if (!base) {       /* no address space for the tail */
+				tail = 0;
+				base = map_aligned(commit,
+						   PROT_READ | PROT_WRITE);
+			} else if (mprotect(base, commit,
+					    PROT_READ | PROT_WRITE) != 0) {
+				munmap(base, commit + tail);
+				base = NULL;
+			}
+		}
+		len = commit + tail;
 	}
 	if (!base)
 		return NULL;
@@ -555,9 +660,66 @@ static void *alloc_big(size_t size, size_t align, int *fresh)
 	h->cls = CLS_LARGE;
 	h->map_base = base;
 	h->map_len = len;
-	h->req = len - off;
+	h->commit = commit;
+	h->commit0 = commit;
+	h->req = commit - off;
 	h->cached = 1;
 	return base + off;
+}
+
+/*
+ * Commit part of a large block's reserved tail so that it can grow where it
+ * stands.  Called with the lock held; returns 0 if the reservation is too
+ * small, in which case realloc() falls back to allocate-copy-free.
+ *
+ * The pages being added read as zero, either because the tail has been
+ * PROT_NONE since the mapping was made or because big_shrink() dropped them
+ * with MADV_DONTNEED on the way into the span cache.  Nothing here relies on
+ * that -- realloc promises nothing about the new bytes -- but it is why this
+ * is not the disclosure path the span cache was.
+ */
+static int big_grow(struct hdr *h, void *p, size_t size)
+{
+	size_t off = (size_t)((char *)p - (char *)h->map_base);
+	size_t want;
+
+	if (size > SIZE_MAX - off - PAGE)
+		return 0;
+	want = round_up(off + size, PAGE);
+	if (want <= h->commit || want > h->map_len)
+		return 0;
+	if (mprotect((char *)h->map_base + h->commit, want - h->commit,
+		     PROT_READ | PROT_WRITE) != 0)
+		return 0;
+	h->commit = want;
+	h->req = want - off;
+	return 1;
+}
+
+/*
+ * Put a grown block back to the size it was mapped at, on the way into the
+ * span cache.
+ *
+ * Without this the cache stops working for the one workload the reservation
+ * is for.  A buffer that is malloc'd at 16 KiB and doubled to 64 KiB is
+ * freed as a 64 KiB mapping, the next iteration asks for 16 KiB, the sizes
+ * do not match, and every round pays a fresh mmap.  Measured on 200 rounds
+ * of the realloc-grow loop: 17 mmaps and 9 munmaps before the reservation
+ * existed, 214 and 587 with it and no shrink, 17 and 9 again with it.
+ *
+ * Both syscalls are needed and neither is enough on its own.  madvise drops
+ * the pages, which is what the RSS is; mprotect takes the access away,
+ * without which the guard tail of any block that had ever grown would be
+ * writable for the rest of the mapping's life.
+ */
+static void big_shrink(struct hdr *h)
+{
+	char *from = (char *)h->map_base + h->commit0;
+	size_t n = h->commit - h->commit0;
+
+	madvise(from, n, MADV_DONTNEED);
+	if (mprotect(from, n, PROT_NONE) == 0)
+		h->commit = h->commit0;
 }
 
 static struct hdr *hdr_of(void *p)
@@ -627,7 +789,9 @@ void free(void *p)
 	if (h->cls == CLS_LARGE) {
 		void *b = h->map_base;
 		size_t l = h->map_len;
-		int keep = h->cached && spancache_put(b, l);
+		if (h->commit > h->commit0)
+			big_shrink(h);
+		int keep = h->cached && spancache_put(b, l, h->commit);
 		/* The header is inside the mapping, so invalidate the magic before
 		 * letting go of it. A cached mapping that still says MAGIC would be
 		 * recognised by hdr_of() through a stale pointer, and free() would
@@ -696,20 +860,23 @@ void *realloc(void *p, size_t size)
 	struct hdr *h = hdr_of(p);
 	size_t old = h ? usable(h) : 0;
 	int small = h && h->cls != CLS_LARGE;
+	/* Growing into the reserved tail is the only reason this is inside the
+	 * lock: it writes h->commit and h->req. */
+	int grown = h && !small && size > old && big_grow(h, p, size);
+	if (grown)
+		old = h->req;
 	unlock();
 	if (!h) {
 		note("slab: realloc() of foreign pointer\n");
 		errno = EINVAL;
 		return NULL;
 	}
+	if (grown)
+		return p;
 	/* In-place when the request still lands in the same class, and for
-	 * large blocks when it still fits the mapping we already have.
-	 * shortcut: no mremap for the large grow case - mremap(MREMAP_MAYMOVE)
-	 * can return an address that is not SPAN_SIZE-aligned, which would
-	 * break the AND-mask header lookup.  Ceiling: growing a 1 MB buffer by
-	 * doubling costs a full copy each time where glibc gets a page-table
-	 * remap.  Upgrade path: reserve a PROT_NONE guard tail per large
-	 * mapping and mprotect it in, so growth never needs to move. */
+	 * large blocks when it still fits the mapping we already have.  A
+	 * large block that outgrows its reserved tail lands here and is
+	 * copied; see RESERVE_K above for how often that is. */
 	if (small) {
 		if (size <= MAXSMALL && cls_of(size) == h->cls)
 			return p;
