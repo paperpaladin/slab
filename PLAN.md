@@ -135,9 +135,14 @@ Ranked by how much it would embarrass us to fail it.
   landing in page-rounding slack. That is a real guard page and it is tested
   as one, but it covers only large blocks, only past the end of the page the
   payload ends in, and it was not the point.
-- Returning memory to the OS. Spans are mapped once and kept. The one place
-  memory does go back is `madvise(MADV_DONTNEED)` on the part of a large
-  mapping a `realloc` had grown into, when that block is freed.
+- ~~Returning memory to the OS.~~ No longer a non-goal, and the entry is
+  kept rather than deleted because the argument it recorded was wrong. A
+  span whose last object has been returned is `madvise(MADV_DONTNEED)`'d
+  while staying mapped, which gives back 94% of a transient peak, and so is
+  the part of a large mapping a `realloc` had grown into. What is still
+  true: the address space is never given back, one empty span per class is
+  kept, and the first page of every span stays resident because the header
+  is in it.
 - Debugging features: no leak tracking, no `mtrace`, no allocation logging.
 - Non-glibc platforms, non-x86-64 architectures, 32-bit, or kernels whose
   page size is not 4096.
@@ -315,10 +320,72 @@ Ranked by how much it would embarrass us to fail it.
         ASan was run against the oracle, where it belongs, and it reports
         `guard`'s deliberate past-the-end write as a heap-buffer-overflow,
         which is independent confirmation that the byte is out of bounds.
-- [ ] Return memory with `madvise(MADV_DONTNEED)` once a span is wholly
+- [x] Return memory with `madvise(MADV_DONTNEED)` once a span is wholly
       free, keeping the mapping so the AND-mask lookup still works.
       - why: peak RSS is currently sticky forever; a program with a large
         transient peak never gives it back.
+      - done: 94% of a 200 MB transient peak comes back, measured from inside
+        the process out of /proc/self/statm: RSS 31004 -> 265292 -> 45692 KiB
+        over allocate, touch, free of 3.7 million 56-byte objects. glibc,
+        jemalloc 5 and tcmalloc_minimal all give back 0% at that instant;
+        glibc returns it on malloc_trim(0) (264992 -> 30940 KiB) and jemalloc
+        with dirty_decay_ms:0 (274580 -> 40532), so the difference is when,
+        not whether. jemalloc still held all of it after a 16-second sleep,
+        because decay purging without background_thread is driven by
+        allocator activity rather than by a timer.
+      - it cost nothing: 0.94x to 1.02x of the previous commit on all six
+        benchmark rows, interleaved, nine repetitions each. And it IMPROVED
+        the one footprint number the suite already had a workload for: peak
+        RSS of the byte-pattern stress run is 0.51x glibc.
+      - the design, which is a rewrite of the small path. Knowing a span is
+        wholly free is impossible with a free list threaded across spans
+        (finding out means walking the whole list), so each span now owns its
+        own free list and a live count, and each class keeps a list of the
+        spans that have room. The invariant everything rests on is that a
+        span is on that list if and only if it has a free object or an
+        unbumped one. Measured separately from the madvise: the data
+        structure change alone is 0.96x to 1.03x, so it is free.
+      - MADV_DONTNEED and not munmap, because the mapping has to stay for the
+        AND-mask lookup. The first page cannot go either (the header is at
+        offset 0 and madvise is page-granular), so 6.25% of every span stays
+        resident, and the objects in that page are zeroed by hand. Skipping
+        that hand-zeroing is a disclosure bug: re-arming the bump pointer
+        tells calloc the span is untouched zero page, and the first page is
+        not. The reclaim check dirties every byte with 0xaa first and then
+        requires 20000 callocs out of re-armed spans to be zero, which is how
+        the mutant that drops the memset is caught.
+      - 23% was lost and then recovered. With no hysteresis, a span of the
+        8192 class holds seven objects, so a drifting workload emptied and
+        refilled spans constantly: 520 extra madvise calls over a bench run
+        cost 10 ns on every operation in the mixed-sizes row (46.7 -> 56.1
+        ns/op). It is not the syscall count, it is the TLB flush across every
+        CPU plus re-faulting the pages. Keeping one empty span per class back
+        took madvise from 624 to 125 and the row to 48.7.
+      - `check` cannot see any of this, and that is worth knowing: its frees
+        go onto a magazine, the magazine does not drain in 4 KiB of traffic,
+        so no span there ever reaches zero live objects. Four mutants, all
+        caught: a span never given back and a reclaim without the madvise
+        (both by the RSS reading), a reclaim that leaves the first page dirty
+        (by the calloc check), and a displaced spare reclaimed without
+        checking it is still empty (by the byte-pattern churn, at iteration
+        43181 with eight blocks clobbered -- silent corruption, and the only
+        check that could have found it).
+      - and one leak that nothing caught until a check was added for it. A
+        span is unlinked from its class when it fills; a mutant that never
+        relinks it when it stops being full leaks every span it ever used and
+        corrupts nothing, exits 0, passes the reclaim check, and passes the
+        Python churn RSS ratio at 1.09x -- identical to the real thing. Peak
+        RSS of the byte-pattern stress run separates them: 0.51x glibc
+        against 1.67x. That check and that mutant are both new.
+      - not mutation-testable, said plainly: removing the one-span hysteresis
+        is a 23% slowdown on one row and nothing else, and the suite asserts
+        no timings. Same for the RESERVE_MIN floor of the previous commit.
+      - UBSan clean against slab on all seven modes (interposed, check,
+        guard, reclaim, stress, thread, tchurn). ASan still cannot see slab
+        at all, for the reason recorded above. Running the oracle under ASan
+        did find a bug in the oracle: the "percentage given back" line
+        underflowed to 18446744073709551608% when RSS ended above the peak
+        reading, which is what ASan's own quarantine makes happen.
 - [ ] Reserve one span-aligned address-space region up front and carve
       large mappings from it with `MAP_FIXED`.
       - why: removes the two trimming `munmap` calls that `map_aligned`

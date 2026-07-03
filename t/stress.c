@@ -488,6 +488,134 @@ static void *worker(void *arg)
 	return NULL;
 }
 
+/* ---------------- reclaim mode ----------------
+ *
+ * Does a transient peak come back down?  Not a slab-specific question: glibc
+ * and every other allocator worth comparing against return large runs of
+ * freed memory to the kernel, so this is a conformance check and t/run.sh
+ * requires BOTH to pass it.  It is in its own mode rather than in `check`
+ * only because it wants a few hundred megabytes.
+ *
+ * Resident size is read out of /proc/self/statm, so the number is the
+ * kernel's rather than ours, and it is read three times: before the
+ * allocation, at the peak, and after everything has been freed.  The reading
+ * at the peak is not decoration -- it is the guard that stops this being a
+ * test of nothing.  An allocator (or a mistake in the loop below) that never
+ * made the memory resident in the first place would satisfy the "it came
+ * back down" assertion trivially, so the peak has to be at least half the
+ * bytes requested before the drop is believed.
+ *
+ * 56 bytes, not 64: glibc rounds a 56-byte request to a 64-byte chunk and
+ * slab puts it in the 64-byte class, so neither side is paying more
+ * per-object overhead than the other and the comparison is about reclaiming
+ * rather than about headers.
+ */
+static size_t vmrss(void)
+{
+	FILE *f = fopen("/proc/self/statm", "r");
+	unsigned long total = 0, res = 0;
+
+	if (!f)
+		return 0;
+	if (fscanf(f, "%lu %lu", &total, &res) != 2)
+		res = 0;
+	fclose(f);
+	return (size_t)res * 4096;
+}
+
+static void check_reclaim(size_t bytes)
+{
+	const size_t sz = 56;
+	size_t n = bytes / sz, i, base, peak, after;
+	void **v = malloc(n * sizeof *v);
+
+	CHECK(v != NULL, "could not allocate the %zu-entry slot array", n);
+	if (!v)
+		return;
+	memset(v, 0, n * sizeof *v);   /* resident before the baseline reading */
+	base = vmrss();
+
+	for (i = 0; i < n; i++) {
+		v[i] = malloc(sz);
+		if (!v[i]) {
+			CHECK(0, "malloc(%zu) failed at object %zu", sz, i);
+			break;
+		}
+		memset(v[i], 0xaa, sz);   /* every byte of every page, dirty */
+	}
+	peak = vmrss();
+	for (i = 0; i < n; i++)
+		free(v[i]);
+	after = vmrss();
+
+	/* Printed unconditionally, because the three numbers are the result and
+	 * t/run.sh puts them in its own output.  A pass/fail alone would hide
+	 * the difference between "gave back nearly all of it" and "squeaked
+	 * under the threshold". */
+	/* Clamped at both ends on purpose. RSS can end up ABOVE the peak
+	 * reading -- it does under ASan, whose quarantine and shadow grow
+	 * while the frees happen -- and the unsigned subtraction then printed
+	 * 18446744073709551608%, which is how this was noticed. */
+	size_t kept = after > base ? after - base : 0;
+	size_t grew = peak > base ? peak - base : 1;
+	printf("reclaim: RSS %zu -> %zu -> %zu KiB, %zu KiB requested, %zu%% "
+	       "of the peak given back\n",
+	       base / 1024, peak / 1024, after / 1024, bytes / 1024,
+	       kept >= grew ? (size_t)0 : 100 - kept * 100 / grew);
+	CHECK(peak > base + bytes / 2,
+	      "the workload never became resident: RSS went from %zu to %zu "
+	      "KiB while allocating %zu KiB, so there was nothing to give back",
+	      base / 1024, peak / 1024, bytes / 1024);
+	CHECK(after < base + (peak - base) / 4,
+	      "%zu KiB of %zu KiB allocated is still resident after freeing all "
+	      "of it (RSS %zu -> %zu -> %zu KiB)",
+	      (after - base) / 1024, (peak - base) / 1024,
+	      base / 1024, peak / 1024, after / 1024);
+
+	/* AND THE DISCLOSURE HALF.  Reclaiming a span re-arms its bump
+	 * pointer, which tells calloc the memory is untouched zero page.  That
+	 * is true for the fifteen pages MADV_DONTNEED threw away and false for
+	 * the first one, which holds the span header and so cannot be given
+	 * back; slab zeroes that page's objects by hand instead.  Every byte
+	 * above was dirtied with 0xaa, so a calloc out of a re-armed span that
+	 * skipped the hand-zeroing hands back 0xaa.
+	 *
+	 * `check` cannot see this.  Its frees go onto a magazine and the
+	 * magazine does not drain in 4 KiB of traffic, so no span there ever
+	 * reaches zero live objects and no reclaim ever happens. */
+	enum { NZ = 20000 };
+	void **z = malloc(NZ * sizeof *z);
+	CHECK(z != NULL, "could not allocate the zero-check slots");
+	if (z) {
+		size_t bad = (size_t)-1, badoff = 0;
+		unsigned char badval = 0;
+		for (i = 0; i < NZ; i++) {
+			/* volatile for the same reason check_calloc() needs it:
+			 * gcc knows calloc returns zeroed memory and will
+			 * delete a loop that only looks for a nonzero byte. */
+			volatile unsigned char *q = calloc(1, sz);
+			z[i] = (void *)q;
+			if (!q)
+				continue;
+			for (size_t j = 0; j < sz; j++)
+				if (q[j]) {
+					bad = i; badoff = j; badval = q[j];
+					break;
+				}
+			if (bad != (size_t)-1)
+				break;
+		}
+		CHECK(bad == (size_t)-1,
+		      "calloc out of a reclaimed span returned byte %zu = 0x%02x "
+		      "of object %zu: the first page of a re-armed span is not "
+		      "being zeroed", badoff, badval, bad);
+		for (i = 0; i < NZ; i++)
+			free(z[i]);
+		free(z);
+	}
+	free(v);
+}
+
 /* ---------------- guard mode ----------------
  *
  * SLAB-SPECIFIC, and the only mode here that is.  Everything above is an
@@ -837,6 +965,8 @@ int main(int argc, char **argv)
 
 	if (!strcmp(mode, "guard")) {
 		check_guard();
+	} else if (!strcmp(mode, "reclaim")) {
+		check_reclaim((size_t)(n ? n : 200) * 1024 * 1024);
 	} else if (!strcmp(mode, "check")) {
 		check_free_null();
 		check_alignment();
@@ -885,7 +1015,8 @@ int main(int argc, char **argv)
 		return 0;
 	} else {
 		fprintf(stderr,
-			"usage: stress check|guard|stress|thread|tchurn|bench [n]\n");
+			"usage: stress check|guard|reclaim|stress|thread|"
+			"tchurn|bench [n]\n");
 		return 2;
 	}
 
