@@ -437,7 +437,7 @@ mutant "a class index one too small for one octave" "check" \
 mutant "a realloc that moves a large block instead of growing it" "guard" \
 	's@\tif (want <= h->commit || want > h->map_len)@\tif (1)@'
 mutant "a reserved tail that is mapped writable instead of PROT_NONE" "guard" \
-	's@base = map_aligned(commit + tail, PROT_NONE);@base = map_aligned(commit + tail, PROT_READ | PROT_WRITE);@'
+	's@base = map_aligned(commit + tail, PROT_NONE, \&len);@base = map_aligned(commit + tail, PROT_READ | PROT_WRITE, \&len);@'
 mutant "a reservation that is never taken" "guard" \
 	's|\tif (commit < RESERVE_MIN)|\tif (1)|'
 mutant "a grown block that keeps its grown size when freed" "guard" \

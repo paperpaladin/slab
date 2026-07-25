@@ -175,29 +175,42 @@ same binary on the same machine in the same sitting.
 
 ```
                         glibc              jemalloc             tcmalloc              slab
-small-churn        13.5 [ 12.9-  14.5]  10.0 [  9.7-  14.9]   9.1 [  8.3-  10.5]   13.1 [  12.4-  13.5]
-mixed-sizes        35.8 [ 34.0-  41.1]  24.5 [ 22.8-  29.1]  18.2 [ 17.5-  19.7]   46.7 [  45.0-  59.2]
-realloc-grow       50.0 [ 46.1-  69.3] 128.6 [121.2- 158.3] 102.4 [ 97.2- 117.9]  149.9 [ 139.6- 169.3]
-large-grow          807 [  798-   957] 13911 [12506- 18829] 15750 [14760- 16858]   2398 [  2223-  3103]
-large-churn         498 [  475-   554]   412 [  378-   592]   237 [  213-   297]   2353 [  2215-  3006]
-4-thread-churn      4.1 [  3.6-   5.5]   3.0 [  2.6-   4.9]   3.4 [  2.4-   5.0]    4.7 [   3.3-   5.6]
+small-churn        14.0 [ 13.2-  15.5]  10.6 [  9.6-  15.0]   9.1 [  8.8-  12.5]   13.3 [  12.7-  19.8]
+mixed-sizes        35.9 [ 34.9-  39.6]  25.0 [ 24.1-  31.1]  18.4 [ 17.6-  20.2]   46.8 [  42.5-  59.5]
+realloc-grow       48.8 [ 47.1-  74.8] 134.2 [126.4- 146.5] 105.0 [100.4- 111.8]  145.0 [ 140.7- 168.8]
+large-grow          917 [  799-  1075] 14642 [13287- 18784] 16961 [15630- 19758]   2275 [  2141-  2481]
+large-churn         531 [  462-  1240]   414 [  385-   513]   232 [  221-   424]   1967 [  1856-  2119]
+4-thread-churn      5.3 [  3.7-   5.7]   4.1 [  2.8-   5.8]   2.4 [  2.3-   5.8]    4.7 [   3.3-   7.4]
 ```
 
 Against glibc, slab loses four rows and takes two: 1.30x on mixed sizes,
-3.00x on short realloc chains, 2.97x on large-grow and 4.72x on large-block
-churn, against 0.97x on small churn (its whole spread sits below glibc's
-median) and 1.15x on four threads, which is inside the spread. Against
-jemalloc and tcmalloc it loses five of six, and the worst of those is
-large-block churn again, 5.7x and 9.9x. Those are the standings and nothing
-here argues them away; a 1000-line allocator with one global lock and a
-16-entry mapping cache is not going to beat three mature ones.
+2.97x on short realloc chains, 2.48x on large-grow and 3.71x on large-block
+churn, against 0.95x on small churn and 0.89x on four threads -- the last of
+which is inside the spread and should be read as a draw. Against jemalloc
+and tcmalloc it loses five of six, and the worst of those is large-block
+churn again, 4.8x and 8.5x. Those are the standings and nothing here argues
+them away; a 1000-line allocator with one global lock and a 16-entry mapping
+cache is not going to beat three mature ones.
 
 The row it takes outright is `large-grow`, a buffer grown from 16 KiB to
-4 MiB by doubling, where slab is 5.8x FASTER than jemalloc and 6.6x faster
-than tcmalloc. It is also the row that moved: 216x glibc before the reserved
-tail described below, and 2.97x after. Measured against the commit before it
-in one interleaved run of ten repetitions each, 207606 ns/op to 2818, a
-factor of 74, while the other five moved by 1.01x to 1.06x.
+4 MiB by doubling, where slab is 6.4x FASTER than jemalloc and 7.5x faster
+than tcmalloc. It is also the row that moved most: 216x glibc before the
+reserved tail described below, and 2.48x after. Measured against the commit
+before it in one interleaved run of ten repetitions each, 207606 ns/op to
+2818, a factor of 74, while the other five moved by 1.01x to 1.06x.
+
+`large-churn` is the worst row and the one still being worked on. It was
+4.72x glibc until `map_aligned` stopped unmapping the alignment slack at the
+end of a reserved mapping, which took it to 3.71x. That change is eleven
+lines and it was sized before it was written, by building a `map_aligned`
+with BOTH of its trimming `munmap` calls deleted -- which leaks address
+space and could never ship, but puts an upper bound on the whole idea:
+0.81x. Keeping the back slack gets 0.85x of it. The front trim is what is
+left, it fires on fifteen calls in sixteen, and removing it needs a real
+address-space allocator for 0.02x more; the PLAN records that and has moved
+the item to the bottom of the list rather than leaving it ranked third on a
+payoff nobody had measured. `munmap` over a benchmark run went from 5108 to
+3479.
 
 ### Growing a large block without copying
 
