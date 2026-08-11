@@ -249,6 +249,35 @@ else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
 fi
 
+# Internal fragmentation, which the README used to argue from the class table
+# rather than measure. `stress frag` does both halves: every request size from
+# 1 to 8192 against the 15-bytes-below-129 and one-fifth-above-129 bounds the
+# table is supposed to give, and then a 20000-object workload checked against
+# slab's own per-span accounting, read back out of malloc_stats() -- which was
+# a no-op until this commit, so slab reported nothing where glibc reports
+# something.
+#
+# The accounting is differenced across two dumps, one before the workload and
+# one with it live, so the C library's own startup allocations cancel instead
+# of being guessed at, and it is taken net of the magazines, because an object
+# on a magazine has been freed by the program and only slab still thinks it is
+# out.
+if LD_PRELOAD="$SLAB" ./t/stress frag "$T/frag.txt" >"$T/fg.out" 2>&1; then
+	ok "fragmentation: $(sed -n 's/^frag: worst case over 8192 sizes: //p' "$T/fg.out")"
+	ok "fragmentation: $(sed -n 's/^frag: //p' "$T/fg.out" | tail -1)"
+else
+	bad "fragmentation: the class spacing or the span accounting is off"
+	grep '^  FAIL' "$T/fg.out" | head -3 | sed 's/^/        /'
+fi
+# Teeth, the same way `guard` gets them: glibc has finer classes above 128 and
+# a 24-byte minimum chunk below it, so it fails the second bound and not the
+# first. An assertion both allocators satisfy would not be about slab's table.
+if ./t/stress frag "$T/fragg.txt" >"$T/fgg.out" 2>&1; then
+	bad "fragmentation: glibc passes these bounds too, so they are not about slab's class table"
+else
+	ok "fragmentation: glibc fails $(grep -c '^  FAIL' "$T/fgg.out") of the per-size bounds, so they are slab's own"
+fi
+
 # Does a transient peak come back down?  A span whose last object has been
 # returned is madvise(MADV_DONTNEED)'d, and `stress reclaim` measures that
 # from inside the process, reading /proc/self/statm before the allocation, at
@@ -394,10 +423,13 @@ MUT="-std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-calloc
 # "rejects" it. That happened while these five were being written and read as
 # four confirmations. So: sed's exit status is checked, and the built library
 # has to change malloc_usable_size(malloc(1)) the way libslab.so does.
+# mutant NAME MODE SEDEXPR [ARG...] -- any ARG is passed to t/stress but left
+# out of the label, so a scratch path does not end up in the suite's output.
 mutant() {
 	name=$1
 	mode=$2
 	expr=$3
+	shift 3
 	if ! sed "$expr" slab.c >"$T/mut.c"; then
 		bad "self-check $name: sed failed (delimiter clash in the expression?)"
 		return
@@ -416,7 +448,7 @@ mutant() {
 		bad "self-check $name: the mutant does not interpose malloc (usable=$_mu, glibc=$g_usable), so rejecting it proves nothing"
 		return
 	fi
-	if LD_PRELOAD="$T/mut.so" ./t/stress $mode >/dev/null 2>&1; then
+	if LD_PRELOAD="$T/mut.so" ./t/stress $mode "$@" >/dev/null 2>&1; then
 		bad "self-check: 'stress $mode' ACCEPTED $name"
 	else
 		ok "self-check: 'stress $mode' rejects $name"
@@ -461,6 +493,17 @@ mutant "a reclaim that re-arms the span without the madvise" "reclaim 200" \
 	's|\tmadvise((char \*)h + PAGE, SPAN_SIZE - PAGE, MADV_DONTNEED);|\t(void)0;|'
 mutant "a reclaim that leaves the span's first page dirty" "reclaim 200" \
 	's|\tmemset((char \*)h + HDR, 0, PAGE - HDR);|\t(void)0;|'
+# Fragmentation and the accounting malloc_stats() reports. The fourth
+# candidate here, deleting the live++ in alloc_small, is left out: `frag`
+# catches it, but so does `reclaim`, and the reclaim mutants already own that
+# counter.
+mutant "a class that wastes more than a fifth of its allocation" "frag" \
+	's|\t5120, 6144, 7168, 8192,|\t6144, 6144, 7168, 8192,|' "$T/mfrag.txt"
+mutant "a dump that does not account for the magazines" "frag" \
+	's|\t\t\tmago += t->m\[cls\].n;|\t\t\tmago += 0;|' "$T/mfrag.txt"
+mutant "arenas that are never recorded, so the dump sees no spans" "frag" \
+	's|\t\tif (narena < ARENA_MAX)|\t\tif (0)|' "$T/mfrag.txt"
+
 mutant "a displaced spare reclaimed without checking it is still empty" "stress 200000" \
 	's@\t\tif (old \&\& old != h \&\& old->live == 0)@\t\tif (old \&\& old != h)@'
 

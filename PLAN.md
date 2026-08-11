@@ -422,10 +422,67 @@ Ranked by how much it would embarrass us to fail it.
         tail mapped writable" stopped matching when map_aligned grew an
         argument, and the did-sed-apply guard turned the suite red instead
         of printing a pass.
-- [ ] A fragmentation visualiser: dump span occupancy to a file descriptor
-      on a signal, render it as a PNG or an HTML heat map offline.
+- [x] A fragmentation visualiser: dump span occupancy to a file descriptor,
+      and measure the claim it was supposed to illustrate.
       - why: internal fragmentation is currently an argument from the class
         spacing, not a measurement of a real workload.
+      - done, and the argument survives contact. The README said four classes
+        per octave above 128 bytes "caps internal fragmentation at 1/5". The
+        new `stress frag` mode checks every request size from 1 to 8192, not
+        a sample, and the worst case is 4097 bytes landing in the 5120 class:
+        19.98% of the allocation wasted. Below 129 the classes are exact
+        16-byte steps, and the worst slack there is 15 bytes. Both bounds are
+        now asserted per size rather than argued.
+      - on a workload: 20000 objects of 129 to 8192 bytes, 81251 KiB
+        requested, 88012 KiB of class, 7.68% of the allocation wasted, 1453
+        spans holding 92992 KiB of which 94% is live objects.
+      - the dump went into malloc_stats(3) rather than a signal handler, and
+        that is a deliberate departure from this item as written. The dump
+        reads the class lists and the arena table, so it takes the lock, and
+        a signal handler that takes a lock the interrupted thread may already
+        hold deadlocks the process it was meant to diagnose. malloc_stats is
+        an entry point programs already call and which this file had as an
+        empty stub, so slab was silently reporting nothing where glibc
+        reports something. The one thing a signal buys -- dumping a process
+        you did not write -- is not worth a deadlock in the allocator.
+      - no PNG and no offline renderer either, and that is also a choice. The
+        heat map is a line of digits per class, one character per span, tenths
+        of capacity in use, '#' full and '.' empty. It needs no renderer, no
+        second file format and no new file, and it is legible to a person and
+        to a script. A PNG would have no oracle behind it.
+      - the accounting is differenced across two dumps, one before the
+        workload and one with it live, so whatever the C library allocated at
+        startup cancels instead of being guessed at. The delta in live
+        objects must equal the number allocated EXACTLY and the delta in live
+        bytes must equal the sum of malloc_usable_size over them exactly:
+        the same quantity by two unrelated routes, per-span counters against
+        per-object class lookups.
+      - that exactness found a real defect in the dump. h->live counts an
+        object as live from the bump pointer until it is handed back to its
+        span, so objects sitting on a magazine -- already freed by the
+        program -- were being reported as live. The first run said 19977
+        where 20000 were expected, and the 23 were the magazine stock left
+        over from the size sweep. A fragmentation report that calls freed
+        objects live is wrong, so the magazines are now walked and reported
+        separately.
+      - three mutants, each caught by the bound it breaks: a class table
+        entry widened so one octave wastes a third (the per-size sweep), a
+        dump that does not subtract the magazines (the exact delta), and
+        arenas that are never recorded so the dump sees no spans at all (the
+        exact delta). A fourth candidate, deleting the live++ in alloc_small,
+        is left out because the reclaim mutants already own that counter.
+      - glibc fails 9 of the per-size bounds -- usable(malloc(1)) is 24 there
+        -- and the suite asserts that it does, the same teeth check `guard`
+        uses: a bound both allocators satisfy is not about slab's table.
+      - performance-neutral, measured because a new 16 KiB BSS array and a
+        few hundred bytes of new code can move code layout: 0.95x to 1.03x
+        across the six rows, fifteen repetitions with the measurement order
+        alternated between the two builds to cancel drift. An unalternated
+        run had said 1.05x to 1.15x on every row at once, which is the
+        signature of drift rather than of a change, and 4-thread-churn went
+        from 1.109x to 0.979x between two such runs of the same pair of
+        binaries. Cache-line-aligning the spinlock was tried as a candidate
+        explanation, made no measurable difference, and is not in the commit.
 - [ ] Trace-replay benchmarking: record every allocator call from a real
       program to a ring buffer, replay the trace against slab and glibc.
       - why: the synthetic benchmark is our guess at a realistic pattern.

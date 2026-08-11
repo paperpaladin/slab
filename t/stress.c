@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -486,6 +487,178 @@ static void *worker(void *arg)
 	      shared, NSHARED, &shmu);
 	free(v);
 	return NULL;
+}
+
+/* ---------------- frag mode ----------------
+ *
+ * SLAB-SPECIFIC. The README argues that four size classes per octave above
+ * 128 bytes "caps internal fragmentation at 1/5". That was an argument about
+ * a table, not a measurement, and this mode turns it into both halves of a
+ * measurement:
+ *
+ * 1. Exhaustively, for every request size from 1 to MAXSMALL:
+ *    malloc_usable_size must be within 15 bytes of the request below 129
+ *    (the classes are exact 16-byte steps there) and within a factor of 5/4
+ *    above it. 8192 sizes, not a sample. glibc does not satisfy the first
+ *    half -- usable(malloc(1)) is 24 there -- so this is slab's claim about
+ *    slab's table.
+ * 2. On a workload, against slab's own per-span accounting read back out of
+ *    malloc_stats(). Two dumps, one before the workload and one with it
+ *    live, so whatever the C library allocated at startup cancels out
+ *    instead of being guessed at. The delta in live objects must equal the
+ *    number allocated EXACTLY, and the delta in live bytes must equal the
+ *    sum of malloc_usable_size over them exactly -- the same quantity
+ *    reached by two unrelated paths, per-span counters against per-object
+ *    lookups, so a disagreement is a bug in one of them.
+ */
+static void dump_stats(const char *path, int append)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC),
+		      0600);
+	int saved;
+
+	CHECK(fd >= 0, "could not open %s for the stats dump", path);
+	if (fd < 0)
+		return;
+	saved = dup(2);
+	fflush(NULL);
+	dup2(fd, 2);
+	malloc_stats();
+	fflush(NULL);
+	dup2(saved, 2);
+	close(saved);
+	close(fd);
+}
+
+/* The nth "slab: small ..." summary line in the dump.  `live` and `bytes`
+ * come back net of the magazines, because an object on a magazine has been
+ * freed by the program and only slab still thinks it is out. */
+static int read_small(const char *path, int nth, size_t *live, size_t *bytes,
+		      size_t *spans, size_t *mapped)
+{
+	FILE *f = fopen(path, "r");
+	char line[8192];
+	int seen = 0;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		size_t a, b, mo, mb, c, d;
+		if (sscanf(line, "slab: small live=%zu livebytes=%zu "
+			   "magazined=%zu magbytes=%zu spans=%zu "
+			   "mappedbytes=%zu", &a, &b, &mo, &mb, &c, &d) != 6)
+			continue;
+		if (++seen != nth)
+			continue;
+		*live = a - mo; *bytes = b - mb; *spans = c; *mapped = d;
+		fclose(f);
+		return 1;
+	}
+	fclose(f);
+	return 0;
+}
+
+static void check_frag(const char *path)
+{
+	enum { NOBJ = 20000 };
+	size_t worst_num = 1, worst_den = 1, worst_at = 0, worst_slack = 0;
+	size_t l0, b0, s0, m0, l1, b1, s1, m1;
+	size_t requested = 0, usable = 0;
+	void **v;
+	size_t i;
+
+	/* (1) every size, not a sample. */
+	for (size_t sz = 1; sz <= 8192; sz++) {
+		void *q = launder(malloc(sz));
+		size_t u;
+		CHECK(q != NULL, "malloc(%zu)", sz);
+		if (!q)
+			return;
+		u = malloc_usable_size(q);
+		CHECK(u >= sz, "usable %zu < requested %zu", u, sz);
+		if (sz <= 128) {
+			if (u - sz > worst_slack) {
+				worst_slack = u - sz;
+				if (u - sz > 15)
+					worst_at = sz;
+			}
+			CHECK(u - sz <= 15,
+			      "request %zu got %zu usable bytes: below 129 the "
+			      "classes are exact 16-byte steps, so the slack "
+			      "cannot exceed 15", sz, u);
+		} else {
+			CHECK(u * 4 < sz * 5,
+			      "request %zu got %zu usable bytes, which is more "
+			      "than the 5/4 the class spacing is supposed to "
+			      "cap waste at", sz, u);
+			if (u * worst_den > worst_num * sz) {
+				worst_num = u; worst_den = sz;
+			}
+		}
+		free(q);
+	}
+	/* Expressed as waste over the ALLOCATION, which is the denominator the
+	 * README's "capped at 1/5" uses: a 4097-byte request lands in the 5120
+	 * class, and 1023/5120 is 19.98%. */
+	printf("frag: worst case over 8192 sizes: %zu bytes of slack at or "
+	       "below 128, and %zu bytes requested in a %zu-byte class = "
+	       "%zu.%02zu%% of the allocation wasted\n",
+	       worst_slack, worst_den, worst_num,
+	       (worst_num - worst_den) * 100 / worst_num,
+	       (worst_num - worst_den) * 10000 / worst_num % 100);
+	(void)worst_at;
+
+	/* (2) a workload, against slab's own accounting. The two arrays are
+	 * deliberately bigger than MAXSMALL so they take the large path and
+	 * do not appear in the span totals below. */
+	v = malloc(NOBJ * sizeof *v);
+	CHECK(v != NULL, "could not allocate the slot array");
+	if (!v)
+		return;
+	dump_stats(path, 0);
+	if (!read_small(path, 1, &l0, &b0, &s0, &m0)) {
+		CHECK(0, "malloc_stats() produced no 'slab: small' line, so "
+		      "there is nothing to measure (not slab, or the dump "
+		      "format moved)");
+		return;
+	}
+	for (i = 0; i < NOBJ; i++) {
+		size_t sz = 129 + (i * 2654435761u) % 8064;
+		v[i] = malloc(sz);
+		if (!v[i]) {
+			CHECK(0, "malloc(%zu) failed at object %zu", sz, i);
+			return;
+		}
+		*(unsigned char *)v[i] = 1;
+		requested += sz;
+		usable += malloc_usable_size(v[i]);
+	}
+	dump_stats(path, 1);
+	if (!read_small(path, 2, &l1, &b1, &s1, &m1)) {
+		CHECK(0, "the second malloc_stats() dump has no summary line");
+		return;
+	}
+	CHECK(l1 - l0 == NOBJ,
+	      "the span counters say %zu objects became live where %d were "
+	      "allocated", l1 - l0, NOBJ);
+	CHECK(b1 - b0 == usable,
+	      "the span counters say %zu live bytes were added; summing "
+	      "malloc_usable_size over the same blocks gives %zu",
+	      b1 - b0, usable);
+	CHECK(usable * 4 < requested * 5,
+	      "%zu bytes requested occupy %zu bytes of class, which is worse "
+	      "than the 5/4 the class spacing promises", requested, usable);
+	printf("frag: %zu objects, %zu KiB requested, %zu KiB in classes "
+	       "(%zu.%02zu%% of the allocation wasted), %zu spans holding "
+	       "%zu KiB (%zu%% occupied by live objects)\n",
+	       (size_t)NOBJ, requested / 1024, usable / 1024,
+	       (usable - requested) * 100 / usable,
+	       (usable - requested) * 10000 / usable % 100,
+	       s1 - s0, (m1 - m0) / 1024,
+	       m1 > m0 ? (b1 - b0) * 100 / (m1 - m0) : 0);
+	for (i = 0; i < NOBJ; i++)
+		free(v[i]);
+	free(v);
 }
 
 /* ---------------- reclaim mode ----------------
@@ -965,6 +1138,8 @@ int main(int argc, char **argv)
 
 	if (!strcmp(mode, "guard")) {
 		check_guard();
+	} else if (!strcmp(mode, "frag")) {
+		check_frag(argc > 2 ? argv[2] : "frag.txt");
 	} else if (!strcmp(mode, "reclaim")) {
 		check_reclaim((size_t)(n ? n : 200) * 1024 * 1024);
 	} else if (!strcmp(mode, "check")) {
@@ -1015,8 +1190,8 @@ int main(int argc, char **argv)
 		return 0;
 	} else {
 		fprintf(stderr,
-			"usage: stress check|guard|reclaim|stress|thread|"
-			"tchurn|bench [n]\n");
+			"usage: stress check|guard|reclaim|frag PATH|stress|"
+			"thread|tchurn|bench [n]\n");
 		return 2;
 	}
 
