@@ -34,7 +34,7 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 53 checks in three tiers.
+`make test` runs 60 checks in three tiers, plus a recorded corpus.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -78,6 +78,12 @@ forked child with `SIGSEGV`, and that a grown block returns to its original
 size when freed. glibc fails all eight of its assertions, and the suite
 asserts that too, because a guard assertion glibc also satisfied would be
 testing the C library rather than the reservation.
+
+Between tiers 2 and 3 sits the recorded corpus, which is described under
+[Real programs, not our guess](#real-programs-not-our-guess): a trace of
+every allocator call `gcc` and CPython make, replayed against slab and
+against glibc, with the replay required to reproduce the trace exactly
+before any timing from it is believed.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
 eighteen deliberately broken slabs: objects that overlap by 8 bytes, a
@@ -143,12 +149,19 @@ ok    peak RSS 1.09x glibc on a churn workload (limit 3.0x)
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
 ok    fragmentation: glibc fails 9 of the per-size bounds, so they are slab's own
-ok    span reclaim: RSS 30896 -> 265248 -> 45708 KiB, 204800 KiB requested, 94% of the peak given back (glibc: 0% of the peak given back)
-ok    peak RSS 0.51x glibc on the byte-pattern stress (limit 1.2x)
+ok    span reclaim: RSS 30920 -> 265208 -> 45668 KiB, 204800 KiB requested, 94% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.50x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
 ok    span cache: 200 large cycles cost 2 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
+ok    trace gcc: 619680 replayable ops, 9817 slots (peak live blocks), 322232 KiB requested
+ok    replay gcc under slab: 1859040 ops in 0.072s = 39.0 ns/op (3 reps, 9817 slots) vs glibc 22.3 ns/op (3 reps, 9817 slots)
+ok    replay gcc under glibc reproduces it too, so the trace is sound
+ok    trace py: 20090 replayable ops, 6312 slots (peak live blocks), 97209 KiB requested
+ok    replay py under slab: 60270 ops in 0.009s = 156.1 ns/op (3 reps, 6312 slots) vs glibc 259.6 ns/op (3 reps, 6312 slots)
+ok    replay py under glibc reproduces it too, so the trace is sound
+ok    self-check: the replay rejects itself when it skips one op in sixteen
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
 ok    self-check: 'stress check' rejects a calloc that never zeroes
 ok    self-check: 'stress check' rejects a realloc that copies half the bytes
@@ -165,10 +178,10 @@ ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of
 ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
 ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (10.53x, limit 1.5x)
-ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.64x, limit 1.2x)
+ok    self-check: peak RSS rejects magazines with no adoption (10.61x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.65x, limit 1.2x)
 
-53 passed, 0 failed, 0 skipped
+60 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -190,6 +203,11 @@ with the full spread in brackets, ns per allocator operation. Lower is
 better. The external baselines are glibc 2.x `malloc`, jemalloc 5 and
 tcmalloc (gperftools) `libtcmalloc_minimal`, all three preloaded into the
 same binary on the same machine in the same sitting.
+
+These six are a guess at how programs allocate, and
+[the recorded traces below](#real-programs-not-our-guess) show the guess is
+wrong in both directions. Read that section before taking any row here as a
+statement about real software.
 
 ```
                         glibc              jemalloc             tcmalloc              slab
@@ -363,6 +381,79 @@ leaves the pages resident and holding the last owner's bytes; `madvise`
 drops them but leaves the tail writable, so the guard would stop at the
 original end of any block that had ever grown. There is a mutant for each
 half.
+
+## Real programs, not our guess
+
+The six rows above are loops somebody wrote down as a guess at how programs
+allocate. `t/librecord.so` is an `LD_PRELOAD` that writes every allocator
+call a program makes to a file; `t/trace.py` turns the recorded pointers
+into slot indices once, offline, so the replay driver needs no hash table
+inside the loop being timed; and `t/replay` reissues the sequence against
+whichever allocator is loaded. That separates the allocator's cost from the
+program's own work, which timing the program end to end cannot do.
+
+**The guess was wrong in both directions**, which is the whole reason for
+doing it. Medians of eleven repetitions, order alternated between
+allocators, ns per operation:
+
+```
+                       ops    glibc   jemalloc   tcmalloc     slab
+gcc -O2 -S          619677     21.2       20.4       12.4     35.8   1.69x glibc
+CPython JSON         20098      251       1063        612      150   0.60x glibc
+```
+
+On the `gcc` trace slab is 1.69x glibc, worse than any synthetic row except
+large-block churn. On the CPython trace it is 0.60x glibc and beats jemalloc
+by 7.1x and tcmalloc by 4.1x, because CPython serves its small objects out of
+its own `obmalloc` and what reaches us is large blocks, which is where the
+reserved tail and the span cache live. Neither of those is a number the
+synthetic benchmark would have predicted.
+
+### And end to end, which the replay deliberately does not measure
+
+```
+                        glibc        jemalloc      tcmalloc        slab
+gcc -O2 -S              0.422s       1.019x        1.003x        1.048x
+CPython JSON            0.190s       1.095x        1.059x        1.007x
+CPython Counter 300k    0.121s       1.005x        1.005x        0.962x
+sort, 3 MB              0.145s       0.988x        1.059x        0.993x
+ls -R /usr/include      0.008s       1.173x        1.560x        1.023x
+```
+
+Medians of thirteen. Allocation is a few percent of what these programs
+spend their time on, so a 1.69x allocator moves the wall clock by noise.
+Both numbers are true and both are here: the replay says what the allocator
+costs, and this says what it costs *you*.
+
+### What the trace is worth, and what it is not
+
+Three things are asserted before any number above is printed. The trace must
+be whole: its trailer has to agree with how many records were read, and it
+must contain no frees of pointers it never allocated. The replay must
+reproduce it exactly -- every free finding its slot occupied, every
+allocation finding it empty -- under slab **and** under glibc, because a
+trace glibc cannot replay is a broken trace rather than a broken allocator.
+And a replay that skips one operation in sixteen must be rejected: that one
+measures 33.8 ns/op and reports 17954 frees of an empty slot, which is
+exactly what a quietly lossy replay would otherwise have looked like.
+
+The recorder had a bug that the trace itself found. `SLAB_TRACE` was a
+filename, and `gcc` forks `cc1` and `as`, all of which inherit `LD_PRELOAD`,
+all of which opened the same path with `O_TRUNC` and wrote from offset 0.
+`cc1` wrote 673094 records; the driver finished afterwards and overwrote the
+first 406 of them. The symptom was 254 frees of pointers nothing in the
+trace had allocated. It is `<prefix>.<pid>` now, and `t/trace.py` refuses a
+file containing two trailers.
+
+It is a **file with a declared cap, not a ring buffer**. A ring keeps the
+last N records, which throws away the allocations that the later frees refer
+to, and then every one of those frees is an orphan with no lifetime.
+
+The honest limit: the replay writes the first and last byte of each block.
+The recorded program touched its memory in some pattern the trace does not
+carry, so page-fault and cache behaviour here is the replay's, not the
+program's. What carries over exactly is the sequence of sizes and the
+lifetimes.
 
 ## Fragmentation
 

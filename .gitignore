@@ -4,3 +4,5 @@ t/stress
 *.so
 core
 core.*
+t/replay
+t/librecord.so

@@ -483,10 +483,66 @@ Ranked by how much it would embarrass us to fail it.
         from 1.109x to 0.979x between two such runs of the same pair of
         binaries. Cache-line-aligning the spinlock was tried as a candidate
         explanation, made no measurable difference, and is not in the commit.
-- [ ] Trace-replay benchmarking: record every allocator call from a real
-      program to a ring buffer, replay the trace against slab and glibc.
+- [x] Trace-replay benchmarking: record every allocator call from a real
+      program, replay the trace against slab, glibc, jemalloc and tcmalloc.
       - why: the synthetic benchmark is our guess at a realistic pattern.
         A recorded `gcc` or CPython trace is not a guess.
+      - done, three new test-side pieces: t/record.c, an LD_PRELOAD that
+        writes every call to a file and forwards to __libc_malloc;
+        t/trace.py, which turns the recorded pointers into slot indices once,
+        offline, so the replay needs no hash table inside the loop being
+        timed; and t/replay.c, which reissues the sequence and times it.
+      - and the answer is that the synthetic benchmark was wrong in BOTH
+        directions, which is the point of having done it. On the gcc trace
+        (619677 ops, 9816 peak live blocks, 322 MB requested) slab is 1.69x
+        glibc, worse than any synthetic row except large-churn. On the
+        CPython JSON trace (20098 ops, 97 MB requested) it is 0.60x glibc
+        and beats jemalloc by 7.1x and tcmalloc by 4.1x, because CPython
+        serves its small objects from its own obmalloc and what reaches us
+        is large blocks, which is where the reserved tail and the span cache
+        live. Medians of eleven, order alternated:
+
+          gcc trace   glibc 21.2  jemalloc 20.4  tcmalloc 12.4  slab 35.8
+          py trace    glibc  251  jemalloc 1063  tcmalloc  612  slab  150
+
+      - and end to end, which the replay deliberately does not measure,
+        five real workloads under each allocator, medians of thirteen: slab
+        is 1.048x glibc on gcc -O2 -S, 1.007x on the CPython JSON workload,
+        0.962x on a 300000-key Counter, 0.993x on sort over 3 MB and 1.023x
+        on ls -R /usr/include. Allocation is a few percent of what these
+        programs do, so a 1.69x allocator moves the wall clock by noise.
+        Both numbers are true and the README prints both.
+      - a FILE with a declared cap, not a ring buffer as this item said. A
+        ring keeps the last N records, which loses the allocations that the
+        later frees refer to, and every one of those frees then becomes an
+        orphan with no lifetime. The cap keeps the first N and the trailer
+        says how many were dropped.
+      - the recorder had a real bug and the trace found it. SLAB_TRACE was a
+        filename; gcc forks cc1 and as, LD_PRELOAD is inherited, all three
+        opened it with O_TRUNC and wrote from offset 0. cc1 wrote 673094
+        records and the driver finished afterwards and overwrote the first
+        406 of them, which showed up as 254 frees of pointers the trace had
+        never allocated. It is <prefix>.<pid> now, and t/trace.py refuses a
+        file containing two trailers, which is what that looked like from
+        the outside.
+      - the suite asserts three things before it prints a number. The trace
+        is whole (its trailer agrees with what was read, and it contains no
+        orphan frees). The replay reproduces it exactly -- every free finding
+        its slot occupied and every allocation finding it empty -- under slab
+        AND under glibc, since a trace glibc cannot replay is a broken trace
+        rather than a broken allocator. And a replay that skips one operation
+        in sixteen is rejected: it measured 33.8 ns/op and reported 17954
+        frees of an empty slot, which is what a quietly lossy replay would
+        have looked like without the check.
+      - the honest limit: the replay writes the first and last byte of each
+        block. The recorded program touched its memory in some pattern the
+        trace does not carry, so page-fault and cache behaviour here is the
+        replay's. What carries over exactly is the sequence of sizes and the
+        lifetimes, which is the part the synthetic benchmark was guessing.
+      - UBSan clean replaying both traces against slab; the replay driver
+        itself was also built with -fsanitize=address,undefined and run,
+        because it indexes a slot array out of a mapped file, and the
+        recorder was built with UBSan and used to record ls -R.
 - [ ] `madvise(MADV_HUGEPAGE)` on arenas and a measurement of whether it
       helps or hurts.
       - why: 4 MiB arenas are exactly the shape THP wants; worth knowing

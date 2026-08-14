@@ -17,13 +17,22 @@ TFLAGS  = -std=gnu11 -O2 -Wall -Wextra \
 	  -fno-builtin-malloc -fno-builtin-calloc \
 	  -fno-builtin-realloc -fno-builtin-free
 
-all: libslab.so t/stress
+all: libslab.so t/stress t/librecord.so t/replay
 
 libslab.so: slab.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 t/stress: t/stress.c
 	$(CC) $(TFLAGS) -o $@ $< -lpthread
+
+# The trace tools.  record is an LD_PRELOAD over the program being recorded,
+# so it is built -fPIC -shared; replay is an ordinary program that runs under
+# whichever allocator is being measured.
+t/librecord.so: t/record.c
+	$(CC) $(TFLAGS) -fPIC -shared -o $@ $<
+
+t/replay: t/replay.c
+	$(CC) $(TFLAGS) -o $@ $<
 
 test: all
 	@t/run.sh
@@ -36,6 +45,6 @@ bench: all
 	@for i in 1 2 3 4 5; do LD_PRELOAD=./libslab.so ./t/stress bench; echo; done
 
 clean:
-	rm -f libslab.so t/stress
+	rm -f libslab.so t/stress t/librecord.so t/replay
 
 .PHONY: all test bench clean
