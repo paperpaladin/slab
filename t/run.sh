@@ -249,6 +249,25 @@ else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
 fi
 
+# Huge pages, with the kernel as the oracle: AnonHugePages in
+# /proc/self/smaps_rollup is the kernel saying how much of the process is
+# really backed by 2 MiB pages. madvise returning 0 says nothing, since
+# MADV_HUGEPAGE is advice. The mode skips itself when
+# transparent_hugepage is not in madvise mode, because with "never" nothing
+# can be backed and with "always" every allocator gets huge pages without
+# asking and the check would be about the kernel's default.
+if LD_PRELOAD="$SLAB" ./t/stress huge >"$T/hg.out" 2>&1; then
+	if grep -q SKIP "$T/hg.out"; then
+		skipped=$((skipped + 1))
+		printf 'SKIP %s\n' "$(sed -n 's/^huge: //p' "$T/hg.out")"
+	else
+		ok "huge pages: $(sed -n 's/^huge: //p' "$T/hg.out")"
+	fi
+else
+	bad "huge pages: the kernel did not back the arenas with any"
+	grep '^  FAIL' "$T/hg.out" | head -2 | sed 's/^/        /'
+fi
+
 # Internal fragmentation, which the README used to argue from the class table
 # rather than measure. `stress frag` does both halves: every request size from
 # 1 to 8192 against the 15-bytes-below-129 and one-fifth-above-129 bounds the
@@ -595,6 +614,15 @@ mutant "a reclaim that leaves the span's first page dirty" "reclaim 200" \
 # candidate here, deleting the live++ in alloc_small, is left out: `frag`
 # catches it, but so does `reclaim`, and the reclaim mutants already own that
 # counter.
+# Huge pages. The second is the one worth having: a 4 MiB arena contains an
+# aligned 2 MiB block wherever it starts, so a span-aligned arena still gets
+# half of itself backed (12288 KiB against 26624), and the first threshold
+# this check used -- a quarter of the bytes asked for -- let it through.
+mutant "arenas that never ask for huge pages" "huge" \
+	's|\t\tmadvise(a, ARENA_LEN, MADV_HUGEPAGE);|\t\t(void)0;|'
+mutant "arenas aligned to a span instead of a huge page" "huge" \
+	's|\t\t\t\t\t NULL, HUGE_PAGE);|\t\t\t\t\t NULL, SPAN_SIZE);|'
+
 mutant "a class that wastes more than a fifth of its allocation" "frag" \
 	's|\t5120, 6144, 7168, 8192,|\t6144, 6144, 7168, 8192,|' "$T/mfrag.txt"
 mutant "a dump that does not account for the magazines" "frag" \
