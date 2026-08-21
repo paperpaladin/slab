@@ -592,7 +592,7 @@ Ranked by how much it would embarrass us to fail it.
         every allocator gets huge pages without asking, so the check would
         be about the kernel's default rather than about slab. 25 runs, 25
         passes, no flakiness. glibc fails it.
-- [ ] Return a dead thread's magazines eagerly, not on adoption.
+- [x] Return a dead thread's magazines eagerly, not on adoption.
       - why: adoption bounds the stranded memory by peak thread count, not by
         threads created, which is enough for a thread pool and not for a
         program that peaks at 500 threads and then runs one. The honest
@@ -600,6 +600,35 @@ Ranked by how much it would embarrass us to fail it.
         (pthread_setspecific allocates for high key indices) or a sweep of
         the registry with tgkill whenever a refill is about to map a new
         span.
+      - done with the second of those, and with the rate limit moved out by
+        a factor of 64: the sweep runs when span_new is about to take a new
+        ARENA from the kernel, not a new span. A sweep on every span would
+        be a syscall per live thread per 64 KiB, which in the 8192 class is
+        a syscall per seven allocations; per 4 MiB it is nothing. If the
+        sweep gave this class anything back, span_new hands that over
+        instead of mapping.
+      - measured: 64 threads held to a barrier so all 64 magazine sets exist
+        at once, then joined. 11077 KiB sitting on dead threads' magazines,
+        7 KiB after the main thread allocated enough to want another arena.
+      - the barrier is load-bearing and the first version did not have it.
+        Created and joined without one, the threads overlap unevenly, later
+        threads adopt earlier threads' sets, and the sweep fires during the
+        run: the check measured 189 KiB stranded where it expected
+        megabytes, and would have passed while proving almost nothing.
+      - two mutants, each caught by the assertion that owns it. Not sweeping
+        at all leaves 11112 KiB where 11107 started. And a sweep that empties
+        the magazine heads WITHOUT handing the objects back to their spans
+        passes the magazined figure perfectly -- the memory is simply gone --
+        so the check also requires that only the objects the main thread
+        actually allocated became live between the dumps: that mutant shows
+        109775 where 12000 were allocated.
+      - the existing teeth check for adoption still measures 11.50x, so the
+        sweep has not made adoption redundant: tchurn runs its threads one
+        at a time, the registry never grows, and there is nothing for a
+        sweep to find.
+      - no regression: 0.96x to 1.05x on the six benchmark rows and both
+        trace replays, thirteen repetitions with the order alternated, and
+        the minima are within a few tenths. UBSan clean on all ten modes.
 - [ ] A `pthread_atfork` child handler that re-initialises the lock.
       - why: a multithreaded program that `fork()`s without `exec()` can
         deadlock in the child's first `malloc` today.
