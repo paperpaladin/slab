@@ -147,7 +147,14 @@ Ranked by how much it would embarrass us to fail it.
 - Non-glibc platforms, non-x86-64 architectures, 32-bit, or kernels whose
   page size is not 4096.
 - Statically linked programs. `LD_PRELOAD` has nothing to interpose.
-- Being fork-safe in a multithreaded process without an intervening `exec`.
+- ~~Being fork-safe in a multithreaded process without an intervening
+  `exec`.~~ No longer a non-goal, and kept here struck through because it
+  was wrong rather than merely out of scope: a drop-in replacement that
+  hangs where the thing it replaces does not is broken. Three
+  `pthread_atfork` handlers, 120 of 200 forks hanging before and 0 after.
+  What is still true is that the first allocation in a child is only safe
+  because slab holds its lock across the fork; nothing here makes the rest
+  of a forked child's use of an inherited heap legal under POSIX.
 
 ## Commit sequence
 
@@ -629,9 +636,50 @@ Ranked by how much it would embarrass us to fail it.
       - no regression: 0.96x to 1.05x on the six benchmark rows and both
         trace replays, thirteen repetitions with the order alternated, and
         the minima are within a few tenths. UBSan clean on all ten modes.
-- [ ] A `pthread_atfork` child handler that re-initialises the lock.
-      - why: a multithreaded program that `fork()`s without `exec()` can
+- [x] A `pthread_atfork` child handler that re-initialises the lock.
+      - why: a multithreaded program that `fork()`s without `exec()`ing can
         deadlock in the child's first `malloc` today.
+      - it was not "can", it was 120 of 200. The test was written first and
+        watched fail: four threads churning, 200 forks, the child arming a
+        timer and allocating. 120 children died of the alarm under slab, 0
+        under glibc. The failure mode is a HANG, so without that timer this
+        check would not have failed, it would have stopped.
+      - done, three handlers rather than one. The PLAN asked for a child
+        handler that re-initialises the lock, and that is the version that
+        is merely unstuck: it leaves the child looking at whatever the
+        holder was half-way through, a free list part-spliced or a span's
+        live count part-updated. Taking the lock in the PREPARE handler
+        means there is no holder to be half-way through. The mutant with
+        prepare emptied out does not hang -- it segfaults, in 8 runs of 8.
+      - and a third thing the item did not mention. The child's magazine set
+        still records the parent's tid, which does not exist there, so a
+        thread created in the child calls tc_claim(), finds a set whose
+        owner is gone, and adopts the one its parent thread is still using;
+        two threads then push and pop the same magazines with no lock. The
+        child handler re-stamps the owner. That mutant SURVIVED the first
+        two versions of the check -- a child with one extra thread adopts
+        one of the four genuinely free sets and never reaches the live one
+        -- and is caught only when the child creates more threads than the
+        parent had.
+      - the constructor is new and the file's "no initialisation step at
+        all" claim had to be narrowed rather than deleted: it registers
+        three handlers and initialises no table, so there is still no "am I
+        initialised yet" flag to race on, and an allocation before it runs
+        is served exactly as one after. What is missing in that window is
+        fork safety, and in that window the process has one thread.
+      - the suite requires glibc to pass it too. This is a drop-in
+        replacement and a hang where the thing it replaces does not hang is
+        a defect, not a difference of opinion about what POSIX permits in a
+        forked child.
+      - the check costs 0.7 s and the three mutants cost most of the rest,
+        because a mutant's children have to wait out their timer. alarm(10)
+        took `make test` from 36 s to 382; a 500 ms setitimer with 35x of
+        headroom over a healthy child's 14 ms takes it to 66.
+      - no hot-path effect, and the measurement says so with a caveat: the
+        handlers run at fork and the constructor runs once. Minima over 21
+        alternated repetitions are 0.98x to 1.05x, which is all that can
+        honestly be claimed, because the machine had a load average of 7.6
+        from other work throughout and the medians were unusable.
 - [ ] Read the page size from `AT_PAGESZ` in the auxiliary vector.
       - why: 4096 is hardcoded, which is simply wrong on a 16 KiB-page
         arm64 kernel, and `sysconf` is not safe to call this early.

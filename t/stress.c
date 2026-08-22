@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <time.h>
@@ -752,6 +753,197 @@ static void check_frag(const char *path)
 	free(v);
 }
 
+/* ---------------- fork mode ----------------
+ *
+ * A multithreaded program that fork()s without exec()ing. POSIX says only
+ * async-signal-safe things are legal in the child, and malloc is not one of
+ * them -- but every allocator that wants to be dropped in has to survive it
+ * anyway, because real programs do it and glibc's malloc handles it.
+ *
+ * The failure is a HANG, not a wrong answer: the child inherits a lock held
+ * by a thread that does not exist there, and nothing will ever release it.
+ * So the child arms alarm(2) and the parent treats a child that died of a
+ * signal as the failure. Without that this check would not fail, it would
+ * stop.
+ *
+ * The child's first allocation is a large one on purpose. A small one can
+ * come off the magazine it inherited without touching the lock at all, and
+ * the check would pass without ever reaching the thing it is about.
+ *
+ * The child then CREATES A THREAD and both of them churn with a verified
+ * byte pattern, which reaches a second hazard the lock has nothing to do
+ * with. Every magazine set in the registry the child inherited, including
+ * the one the child's own thread is using, records a tid from the parent --
+ * tids that do not exist here. A thread created in the child calls
+ * tc_claim(), finds a set whose owner is gone, and adopts the one its
+ * parent thread is still using. Two threads then push and pop the same
+ * magazines with no lock between them and the same object comes out twice.
+ * Without the second thread that mutant survives the whole suite.
+ */
+static long fork_child_ops = 3000;
+
+static int fork_churn(uint64_t s)
+{
+	struct { void *p; uint32_t tag; size_t n; } v[128];
+	int bad = 0;
+	long i;
+	unsigned k;
+
+	memset(v, 0, sizeof v);
+	for (i = 0; i < fork_child_ops; i++) {
+		k = (unsigned)(rnd(&s) % 128);
+		if (v[k].p) {
+			if (!verify(v[k].p, v[k].tag, v[k].n))
+				bad++;
+			free(v[k].p);
+			v[k].p = NULL;
+		} else {
+			size_t n = 16 + rnd(&s) % 2000;
+			v[k].p = malloc(n);
+			if (!v[k].p) {
+				bad++;
+				continue;
+			}
+			v[k].n = n;
+			v[k].tag = (uint32_t)rnd(&s);
+			fill(v[k].p, v[k].tag, n);
+		}
+	}
+	for (k = 0; k < 128; k++)
+		if (v[k].p) {
+			if (!verify(v[k].p, v[k].tag, v[k].n))
+				bad++;
+			free(v[k].p);
+		}
+	return bad;
+}
+
+static void *fork_child_worker(void *arg)
+{
+	return (void *)(uintptr_t)fork_churn((uint64_t)(uintptr_t)arg + 101);
+}
+
+static volatile int fork_stop;
+
+static void *fork_worker(void *arg)
+{
+	uint64_t s = (uint64_t)(uintptr_t)arg + 1;
+	void *v[64] = {0};
+	unsigned k;
+
+	while (!fork_stop) {
+		k = (unsigned)(rnd(&s) % 64);
+		if (v[k]) {
+			free(v[k]);
+			v[k] = NULL;
+		} else {
+			v[k] = malloc(16 + rnd(&s) % 4000);
+			if (v[k])
+				*(unsigned char *)v[k] = 1;
+		}
+	}
+	for (k = 0; k < 64; k++)
+		free(v[k]);
+	return NULL;
+}
+
+static void check_fork(long nfork)
+{
+	enum { NT = 4, NCHILD = 200 };
+	/* 3 from a child whose byte patterns did not survive, 2 from one that
+	 * could not allocate at all. */
+	pthread_t th[NT];
+	long i;
+	int hung = 0, failed = 0;
+
+	fflush(NULL);          /* nothing buffered for a child to duplicate */
+	for (i = 0; i < NT; i++)
+		if (pthread_create(&th[i], NULL, fork_worker,
+				   (void *)(uintptr_t)i) != 0) {
+			CHECK(0, "pthread_create failed at %ld", i);
+			return;
+		}
+	for (i = 0; i < nfork; i++) {
+		pid_t c = fork();
+		int st = 0;
+
+		if (c == 0) {
+			struct itimerval deadline = {{0, 0}, {0, 500000}};
+			void *big, *q[NCHILD];
+			/* NT + 2 threads, not one. The child inherits a
+			 * magazine set per thread the parent had, and all of
+			 * them except the one this thread is using are
+			 * genuinely free, so the first few threads created
+			 * here adopt those and never reach it. The mutant
+			 * that leaves this thread's set stamped with a dead
+			 * tid survives entirely if the child creates fewer
+			 * threads than the parent had. */
+			pthread_t ct[NT + 2];
+			void *r2 = NULL;
+			int j, bad, nc = 0;
+
+			/* 500 ms, not alarm(1), because the whole cost of
+			 * this check is the mutants: a child that deadlocks
+			 * waits out the timer, and three mutants hanging
+			 * half their children at ten seconds each took
+			 * `make test` from 36 seconds to 382. A healthy
+			 * child here takes 14 ms, so this is 35x of
+			 * headroom. */
+			setitimer(ITIMER_REAL, &deadline, NULL);
+			big = malloc(100000);     /* always takes the lock */
+			if (!big)
+				_exit(2);
+			*(unsigned char *)big = 1;
+			for (j = 0; j < NCHILD; j++) {
+				q[j] = malloc(32 + (size_t)j * 7);
+				if (!q[j])
+					_exit(2);
+				*(unsigned char *)q[j] = 1;
+			}
+			for (j = 0; j < NCHILD; j++)
+				free(q[j]);
+			free(big);
+			for (j = 0; j < NT + 2; j++)
+				if (pthread_create(&ct[j], NULL,
+						   fork_child_worker,
+						   (void *)(uintptr_t)(i + j))
+				    == 0)
+					nc++;
+			if (nc != NT + 2)
+				_exit(2);
+			bad = fork_churn((uint64_t)i + 7);
+			for (j = 0; j < nc; j++) {
+				pthread_join(ct[j], &r2);
+				if (r2)
+					bad++;
+			}
+			_exit(bad ? 3 : 0);
+		}
+		if (c < 0 || waitpid(c, &st, 0) != c) {
+			failed++;
+			continue;
+		}
+		if (WIFSIGNALED(st))
+			hung++;
+		else if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+			failed++;
+	}
+	fork_stop = 1;
+	for (i = 0; i < NT; i++)
+		pthread_join(th[i], NULL);
+
+	printf("fork: %ld children allocated inside a fork of a %d-thread "
+	       "process, %d hung, %d failed\n", nfork, NT, hung, failed);
+	CHECK(hung == 0,
+	      "%d of %ld children died of a signal, which here means the "
+	      "alarm fired or something faulted: either the child's first "
+	      "malloc found the lock held by a thread that does not exist "
+	      "there, or two of its threads are sharing a magazine set",
+	      hung, nfork);
+	CHECK(failed == 0, "%d of %ld children could not allocate", failed,
+	      nfork);
+}
+
 /* ---------------- sweep mode ----------------
  *
  * SLAB-SPECIFIC. A thread that exits runs none of slab's code, so whatever
@@ -1435,6 +1627,8 @@ int main(int argc, char **argv)
 		check_tlb(n ? n : 2000000, 20000000);
 	} else if (!strcmp(mode, "huge")) {
 		check_huge(n ? n : 400000);
+	} else if (!strcmp(mode, "fork")) {
+		check_fork(n ? n : 200);
 	} else if (!strcmp(mode, "sweep")) {
 		check_sweep(argc > 2 ? argv[2] : "sweep.txt");
 	} else if (!strcmp(mode, "frag")) {
@@ -1489,7 +1683,7 @@ int main(int argc, char **argv)
 		return 0;
 	} else {
 		fprintf(stderr,
-			"usage: stress check|guard|reclaim|huge|tlb|"
+			"usage: stress check|guard|reclaim|huge|tlb|fork|"
 			"frag PATH|sweep PATH|stress|thread|tchurn|bench [n]\n");
 		return 2;
 	}
