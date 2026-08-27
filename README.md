@@ -34,7 +34,7 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 71 checks in three tiers, plus a recorded corpus.
+`make test` runs 73 checks in three tiers, plus a recorded corpus.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -86,7 +86,7 @@ against glibc, with the replay required to reproduce the trace exactly
 before any timing from it is believed.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
-twenty-five deliberately broken slabs: objects that overlap by 8 bytes, a
+twenty-six deliberately broken slabs: objects that overlap by 8 bytes, a
 `calloc` that never zeroes, a `realloc` that copies half the bytes, a class
 index one too small for one octave, magazines with no adoption, a `realloc`
 that moves a large block instead of growing it, a reserved tail mapped
@@ -102,7 +102,8 @@ sees no spans, arenas that never ask for huge pages, arenas aligned to a
 span instead of a huge page, magazines reclaimed only on adoption, a
 sweep that drops a dead thread's magazines instead of returning them, no
 `pthread_atfork` handlers at all, a prepare handler that does not take the
-lock, and a child that does not re-stamp its magazine set. Each must be rejected *by the check that owns that
+lock, a child that does not re-stamp its magazine set, and a
+page size that is not the kernel's. Each must be rejected *by the check that owns that
 behaviour*, not merely by some check somewhere. That distinction is
 load-bearing; see below.
 
@@ -149,25 +150,26 @@ ok    guard: glibc fails 8 of its assertions, so none of them is free
 ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
-ok    peak RSS 1.12x glibc on a churn workload (limit 3.0x)
+ok    peak RSS 1.10x glibc on a churn workload (limit 3.0x)
 ok    fork: a multithreaded process forks and the child allocates
 ok    fork: glibc malloc survives it too, so the oracle is right
-ok    magazine sweep: 64 dead threads held 11092 KiB on their magazines, 7 KiB left after the next arena was wanted
+ok    magazine sweep: 64 dead threads held 11077 KiB on their magazines, 7 KiB left after the next arena was wanted
 ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
-ok    fragmentation: glibc fails 9 of the per-size bounds, so they are slab's own
-ok    span reclaim: RSS 33072 -> 265504 -> 45964 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
-ok    peak RSS 0.67x glibc on the byte-pattern stress (limit 1.2x)
+ok    geometry: page=4096, span=65536 (sysconf says 4096, AT_PAGESZ says 4096)
+ok    fragmentation: glibc fails 9 of its assertions, so they are about slab's own table and geometry
+ok    span reclaim: RSS 33056 -> 265488 -> 45948 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.70x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
-ok    span cache: 200 large cycles cost 1 munmaps (glibc 2)
+ok    span cache: 200 large cycles cost 2 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
-ok    trace gcc: 809925 replayable ops, 10820 slots (peak live blocks), 391071 KiB requested
-ok    replay gcc under slab: 2429775 ops in 0.083s = 34.2 ns/op (3 reps, 10820 slots) vs glibc 29.7 ns/op (3 reps, 10820 slots)
+ok    trace gcc: 827690 replayable ops, 10963 slots (peak live blocks), 399454 KiB requested
+ok    replay gcc under slab: 2483070 ops in 0.098s = 39.5 ns/op (3 reps, 10963 slots) vs glibc 39.5 ns/op (3 reps, 10963 slots)
 ok    replay gcc under glibc reproduces it too, so the trace is sound
 ok    trace py: 20083 replayable ops, 6305 slots (peak live blocks), 97208 KiB requested
-ok    replay py under slab: 60249 ops in 0.012s = 195.0 ns/op (3 reps, 6305 slots) vs glibc 281.4 ns/op (3 reps, 6305 slots)
+ok    replay py under slab: 60249 ops in 0.012s = 199.6 ns/op (3 reps, 6305 slots) vs glibc 379.3 ns/op (3 reps, 6305 slots)
 ok    replay py under glibc reproduces it too, so the trace is sound
 ok    self-check: the replay rejects itself when it skips one op in sixteen
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
@@ -189,14 +191,15 @@ ok    self-check: 'stress sweep' rejects magazines reclaimed only on adoption
 ok    self-check: 'stress sweep' rejects a sweep that drops the magazines instead of returning them
 ok    self-check: 'stress huge' rejects arenas that never ask for huge pages
 ok    self-check: 'stress huge' rejects arenas aligned to a span instead of a huge page
+ok    self-check: 'stress frag' rejects a page size that is not the kernel's
 ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of its allocation
 ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
 ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (11.22x, limit 1.5x)
-ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.74x, limit 1.2x)
+ok    self-check: peak RSS rejects magazines with no adoption (11.15x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.83x, limit 1.2x)
 
-71 passed, 0 failed, 0 skipped
+73 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -641,6 +644,28 @@ program -- were reported as live. The first run said 19977 where 20000 were
 expected, and the 23 were magazine stock left over from the size sweep that
 runs before it. A fragmentation report that calls freed objects live is
 wrong, so the magazines are walked and reported separately now.
+
+## The page size, and what cannot be checked here
+
+4096 was a compile-time constant until recently, which is simply wrong on a
+16 KiB- or 64 KiB-page arm64 kernel: the trimming `munmap` in `map_aligned`
+would be rejected for a non-page-aligned length and large allocations would
+leak address space. It comes from `AT_PAGESZ` now, read with `getauxval`
+rather than `sysconf`, because `sysconf` is allowed to allocate and this is
+reached from inside `malloc`.
+
+It is read lazily on first use and not in the constructor the `atfork`
+handlers added, because a constructor runs after the dynamic linker has
+already allocated through us, and a window in which a block is rounded with
+one value and freed with another is worse than no change at all.
+
+**What the suite can check is only half of it.** Every x86-64 kernel reports
+4096, so the check compares slab's notion against `sysconf(_SC_PAGESIZE)`
+and `getauxval(AT_PAGESZ)` and requires a span to be a whole number of
+pages. It cannot run on the kernel the change is for. A mutant hardcoding
+8192 is caught; a mutant reading `AT_CLKTCK` is deliberately absent, because
+100 fails the power-of-two guard and falls back to 4096, which is the right
+answer by accident.
 
 ## Sanitizers, and what they cannot reach
 

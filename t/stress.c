@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <sys/auxv.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -650,6 +651,62 @@ static int read_small(const char *path, int nth, size_t *live, size_t *bytes,
 	return 0;
 }
 
+/* The "slab: geometry ..." line of a dump. */
+static int read_geometry(const char *path, size_t *pg, size_t *span)
+{
+	FILE *f = fopen(path, "r");
+	char line[8192];
+	int got = 0;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		size_t a, b;
+		if (sscanf(line, "slab: geometry page=%zu span=%zu",
+			   &a, &b) != 2)
+			continue;
+		*pg = a; *span = b;
+		got = 1;
+		break;
+	}
+	fclose(f);
+	return got;
+}
+
+/*
+ * The page size slab is using, against the two places the C library will
+ * say what it is.  4096 is no longer compiled in; it comes from AT_PAGESZ.
+ *
+ * This is the whole oracle available on an x86-64 machine and it is worth
+ * being plain about that: every kernel this runs on has 4096-byte pages, so
+ * what is checked is that slab agrees with glibc about the number, not that
+ * it would behave on the 16 KiB- or 64 KiB-page arm64 kernel the change is
+ * for.  A mutant that hardcodes a different number is caught; a kernel that
+ * reports a different number cannot be tried here.
+ */
+static void check_geometry(const char *path)
+{
+	size_t pg = 0, span = 0;
+	long sc = sysconf(_SC_PAGESIZE);
+	unsigned long ax = getauxval(AT_PAGESZ);
+
+	if (!read_geometry(path, &pg, &span)) {
+		CHECK(0, "the dump has no 'slab: geometry' line");
+		return;
+	}
+	printf("frag: page=%zu, span=%zu (sysconf says %ld, AT_PAGESZ says "
+	       "%lu)\n", pg, span, sc, ax);
+	CHECK(sc > 0 && pg == (size_t)sc,
+	      "slab is rounding to a %zu-byte page where sysconf(_SC_PAGESIZE) "
+	      "says %ld", pg, sc);
+	CHECK(ax == 0 || pg == (size_t)ax,
+	      "slab is rounding to a %zu-byte page where AT_PAGESZ says %lu",
+	      pg, ax);
+	CHECK(pg && span % pg == 0,
+	      "a %zu-byte span is not a whole number of %zu-byte pages, so a "
+	      "span cannot be given back to the kernel at all", span, pg);
+}
+
 static void check_frag(const char *path)
 {
 	enum { NOBJ = 20000 };
@@ -751,6 +808,7 @@ static void check_frag(const char *path)
 	for (i = 0; i < NOBJ; i++)
 		free(v[i]);
 	free(v);
+	check_geometry(path);
 }
 
 /* ---------------- fork mode ----------------

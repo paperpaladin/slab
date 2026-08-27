@@ -680,9 +680,35 @@ Ranked by how much it would embarrass us to fail it.
         alternated repetitions are 0.98x to 1.05x, which is all that can
         honestly be claimed, because the machine had a load average of 7.6
         from other work throughout and the medians were unusable.
-- [ ] Read the page size from `AT_PAGESZ` in the auxiliary vector.
+- [x] Read the page size from `AT_PAGESZ` in the auxiliary vector.
       - why: 4096 is hardcoded, which is simply wrong on a 16 KiB-page
         arm64 kernel, and `sysconf` is not safe to call this early.
+      - done, read lazily on first use rather than in the constructor that
+        now exists. A constructor runs after the dynamic linker has already
+        allocated through us, which would leave a window where a block is
+        rounded with one value and freed with another. getauxval does not
+        allocate, so there is no reason to defer it to a safe moment; there
+        is no safe moment that is also early enough.
+      - the fallback for a missing or non-power-of-two value is 4096, not a
+        refusal: an allocator that will not start is worse than one that is
+        wrong in exactly the way it was wrong before this commit.
+      - the oracle is glibc, and the limit of it is worth stating. Every
+        x86-64 kernel reports 4096, so what the suite can check is that
+        slab agrees with sysconf(_SC_PAGESIZE) and with getauxval(AT_PAGESZ)
+        about the number, and that a span is a whole number of pages. What
+        it cannot do is run on the 16 KiB- or 64 KiB-page arm64 kernel the
+        change is for. A mutant that hardcodes 8192 is caught by both
+        comparisons; a mutant that reads AT_CLKTCK instead is NOT in the
+        suite, because 100 fails the power-of-two guard and falls back to
+        4096, which is the right answer by accident.
+      - span_reclaim grew a guard: on a 64 KiB-page kernel a span is one
+        page, the header is in it, and there is nothing to madvise. It
+        skips rather than calling madvise with a length of zero.
+      - the mutation harness caught two of its own expressions going stale
+        again, since two reclaim mutants matched on the literal PAGE. The
+        did-sed-apply guard turned the suite red rather than printing a
+        pass for a mutant that was never built, for the second time in this
+        milestone.
 - [ ] Shrink large blocks in place on `realloc` down, `munmap`ing the tail.
       - why: `realloc(p_1MB, 100)` keeps a megabyte resident today.
 - [ ] Optional free-list pointer mangling and a cheap double-free check,

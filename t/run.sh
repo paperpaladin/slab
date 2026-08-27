@@ -325,7 +325,8 @@ fi
 # out.
 if LD_PRELOAD="$SLAB" ./t/stress frag "$T/frag.txt" >"$T/fg.out" 2>&1; then
 	ok "fragmentation: $(sed -n 's/^frag: worst case over 8192 sizes: //p' "$T/fg.out")"
-	ok "fragmentation: $(sed -n 's/^frag: //p' "$T/fg.out" | tail -1)"
+	ok "fragmentation: $(sed -n 's/^frag: \([0-9]* objects.*\)/\1/p' "$T/fg.out")"
+	ok "geometry: $(sed -n 's/^frag: page=/page=/p' "$T/fg.out")"
 else
 	bad "fragmentation: the class spacing or the span accounting is off"
 	grep '^  FAIL' "$T/fg.out" | head -3 | sed 's/^/        /'
@@ -336,7 +337,7 @@ fi
 if ./t/stress frag "$T/fragg.txt" >"$T/fgg.out" 2>&1; then
 	bad "fragmentation: glibc passes these bounds too, so they are not about slab's class table"
 else
-	ok "fragmentation: glibc fails $(grep -c '^  FAIL' "$T/fgg.out") of the per-size bounds, so they are slab's own"
+	ok "fragmentation: glibc fails $(grep -c '^  FAIL' "$T/fgg.out") of its assertions, so they are about slab's own table and geometry"
 fi
 
 # Does a transient peak come back down?  A span whose last object has been
@@ -649,9 +650,9 @@ mutant "a shrink that drops the pages but leaves the tail writable" "guard" \
 mutant "a wholly free span that is never given back" "reclaim 200" \
 	's|\tif (--h->live == 0) {|\tif (0) {|'
 mutant "a reclaim that re-arms the span without the madvise" "reclaim 200" \
-	's|\tmadvise((char \*)h + PAGE, SPAN_SIZE - PAGE, MADV_DONTNEED);|\t(void)0;|'
+	's|\tif (page() < SPAN_SIZE)|\tif (0)|'
 mutant "a reclaim that leaves the span's first page dirty" "reclaim 200" \
-	's|\tmemset((char \*)h + HDR, 0, PAGE - HDR);|\t(void)0;|'
+	's|\tmemset((char \*)h + HDR, 0, page() - HDR);|\t(void)0;|'
 # Fragmentation and the accounting malloc_stats() reports. The fourth
 # candidate here, deleting the live++ in alloc_small, is left out: `frag`
 # catches it, but so does `reclaim`, and the reclaim mutants already own that
@@ -686,6 +687,15 @@ mutant "arenas that never ask for huge pages" "huge" \
 	's|\t\tmadvise(a, ARENA_LEN, MADV_HUGEPAGE);|\t\t(void)0;|'
 mutant "arenas aligned to a span instead of a huge page" "huge" \
 	's|\t\t\t\t\t NULL, HUGE_PAGE);|\t\t\t\t\t NULL, SPAN_SIZE);|'
+
+# The page size. On an x86-64 machine every kernel reports 4096, so what
+# this can catch is slab disagreeing with glibc about the number, not slab
+# misbehaving on the 16 KiB-page arm64 kernel the change is for. A mutant
+# that reads AT_CLKTCK instead would be caught by the power-of-two guard and
+# fall back to 4096, which is the right answer by accident, so it is not
+# here.
+mutant "a page size that is not the kernel's" "frag" \
+	's|\t\tp = (size_t)getauxval(AT_PAGESZ);|\t\tp = 8192;|' "$T/mfrag.txt"
 
 mutant "a class that wastes more than a fifth of its allocation" "frag" \
 	's|\t5120, 6144, 7168, 8192,|\t6144, 6144, 7168, 8192,|' "$T/mfrag.txt"
