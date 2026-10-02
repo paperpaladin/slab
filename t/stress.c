@@ -1304,6 +1304,11 @@ static void check_reclaim(size_t bytes)
  *    writing a byte past the end of the block in a forked child and
  *    requiring that child to die of SIGSEGV.  mprotect returning 0 is not
  *    evidence; a fault is.
+ * 3b. Does realloc DOWN give the tail back?  Resident size out of
+ *    /proc/self/statm before and after, the pointer unchanged, the content
+ *    kept, and the guard moved down to the block's new end -- that last one
+ *    is what separates giving the pages back from also taking the access
+ *    away, and there is a mutant for each.
  * 3. Does a grown block go back to its natural size when freed?  The span
  *    cache matches on that size, so without the restore a buffer that is
  *    malloc'd small and doubled is never reused, which measured as 200
@@ -1396,6 +1401,65 @@ static void check_guard(void)
 	sig = fault_on_write(q, uq);
 	CHECK(sig == SIGSEGV, "after growing, writing q[%zu] died of signal %d, "
 	      "wanted SIGSEGV", uq, sig);
+
+	/* (3b) realloc down hands the tail back. 64 MiB so the measurement is
+	 * well clear of everything else the process is holding. */
+	{
+		/* 8 MiB and not 64: big enough that the resident drop is
+		 * unmistakable, small enough that the mapping still fits the
+		 * span cache, which the last assertion here needs. */
+		const size_t big = 8u << 20;
+		unsigned char *w = launder(malloc(big));
+		unsigned char *x;
+		size_t before, after, ux;
+
+		CHECK(w != NULL, "malloc(%zu)", big);
+		if (!w)
+			return;
+		memset(w, 0xbb, big);
+		before = vmrss();
+		x = launder(realloc(w, 1000));
+		after = vmrss();
+		CHECK(x != NULL, "realloc(p, 1000) returned NULL");
+		if (!x)
+			return;
+		CHECK(x == w, "realloc down from %zu to 1000 moved the block "
+		      "(%p -> %p)", big, (void *)w, (void *)x);
+		CHECK(x[0] == 0xbb && x[999] == 0xbb,
+		      "content lost shrinking in place");
+		CHECK(before > after + big / 2,
+		      "shrinking a %zu KiB block to 1000 bytes gave back %zu "
+		      "KiB of resident memory (RSS %zu -> %zu KiB)",
+		      big / 1024, (before - after) / 1024, before / 1024,
+		      after / 1024);
+		ux = malloc_usable_size(x);
+		CHECK(ux < big / 2,
+		      "after shrinking to 1000 bytes the block still reports "
+		      "%zu usable", ux);
+		sig = fault_on_write(x, ux);
+		CHECK(sig == SIGSEGV,
+		      "after shrinking, writing x[%zu] died of signal %d: the "
+		      "pages were dropped but the access was not taken away",
+		      ux, sig);
+		/* And the trim must not cost the mapping its place in the
+		 * span cache. Freed and asked for again at the size it was
+		 * made at, it has to come back -- otherwise a single realloc
+		 * down throws the mapping away and the next request pays a
+		 * fresh mmap and several hundred page faults, which measured
+		 * as 33% on the recorded CPython replay. */
+		free(x);
+		{
+			unsigned char *y = launder(malloc(big));
+
+			CHECK(y == w,
+			      "after a realloc down and a free, asking for "
+			      "%zu again gave %p rather than the mapping that "
+			      "was just released (%p): a trimmed block is "
+			      "going into the span cache at its trimmed size",
+			      big, (void *)y, (void *)w);
+			free(y);
+		}
+	}
 
 	/* (3) freed at four times its natural size, reusable at its natural
 	 * size, with the guard back where it started */

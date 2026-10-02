@@ -205,7 +205,7 @@ static unsigned  narena, arena_overflow;
  * about 250 distinct lengths for a 16-entry cache to miss.
  *
  * A mapping that a realloc grew is restored to the size it was mapped with
- * before it goes in here; see big_shrink().  Without that the matching above
+ * before it goes in here; see big_restore().  Without that the matching above
  * never fires for the one workload the reservation exists for.
  *
  * Only the plain path is cached. The over-aligned path (align >= SPAN_SIZE)
@@ -1002,7 +1002,7 @@ static void *alloc_big(size_t size, size_t align, int *fresh)
  * small, in which case realloc() falls back to allocate-copy-free.
  *
  * The pages being added read as zero, either because the tail has been
- * PROT_NONE since the mapping was made or because big_shrink() dropped them
+ * PROT_NONE since the mapping was made or because big_restore() dropped them
  * with MADV_DONTNEED on the way into the span cache.  Nothing here relies on
  * that -- realloc promises nothing about the new bytes -- but it is why this
  * is not the disclosure path the span cache was.
@@ -1026,29 +1026,96 @@ static int big_grow(struct hdr *h, void *p, size_t size)
 }
 
 /*
- * Put a grown block back to the size it was mapped at, on the way into the
- * span cache.
+ * realloc() DOWN on a large block: hand the tail back now, rather than
+ * holding a megabyte because a program read a file and then trimmed the
+ * buffer to the length it turned out to be.
+ *
+ * munmap is what the PLAN said and it is the wrong tool once the block has
+ * a PROT_NONE reservation behind it: unmapping the tail punches a hole in
+ * the middle of a mapping this allocator still owns, costs the block its
+ * ability to grow again, and leaves map_len describing something that no
+ * longer exists.  Decommitting it instead -- mprotect then madvise -- gives
+ * the pages back, keeps the guard where the block now ends, and leaves the
+ * reservation intact.
+ *
+ * The order matters: mprotect first, because it is the call that can fail,
+ * and failing after the madvise would leave the block reporting usable
+ * bytes whose contents had just been thrown away.
+ *
+ * commit0 does NOT move, and that is the whole difference between this
+ * costing nothing and costing 30%.  commit0 is the size the mapping was
+ * made at, which is what the span cache matches a freed mapping on; moving
+ * it down meant a trimmed block went into the cache at its trimmed size,
+ * never matched the next request for the size it was made at, and the
+ * workload paid a fresh mmap and several hundred page faults instead.  ONE
+ * realloc down in the recorded CPython trace was enough to take that replay
+ * from 150 to 199 ns/op.  big_restore() below puts the block back.
+ *
+ * shortcut: SHRINK_MIN, below which the tail is kept.  The two syscalls
+ * include a TLB flush across every CPU the process has run on, and a block
+ * that grows again has to fault the pages back; the same argument, and the
+ * same number, as RESERVE_MIN above.  Ceiling: a program that trims a
+ * 100 KiB buffer to 1 KiB keeps the 100 KiB.  Upgrade path: nothing cheap;
+ * the floor is the cost of the syscalls.
+ */
+#define SHRINK_MIN RESERVE_MIN
+
+static int big_trim(struct hdr *h, void *p, size_t size)
+{
+	size_t off = (size_t)((char *)p - (char *)h->map_base);
+	size_t want;
+
+	if (!h->cached)        /* over-aligned: a different geometry entirely */
+		return 0;
+	if (size > SIZE_MAX - off - page())
+		return 0;
+	want = round_up(off + size, page());
+	if (want >= h->commit || h->commit - want < SHRINK_MIN)
+		return 0;
+	if (mprotect((char *)h->map_base + want, h->commit - want,
+		     PROT_NONE) != 0)
+		return 0;
+	madvise((char *)h->map_base + want, h->commit - want, MADV_DONTNEED);
+	h->commit = want;
+	h->req = want - off;
+	return 1;
+}
+
+/*
+ * Put a block back to the size it was mapped at, on the way into the span
+ * cache, in whichever direction a realloc has moved it.
  *
  * Without this the cache stops working for the one workload the reservation
  * is for.  A buffer that is malloc'd at 16 KiB and doubled to 64 KiB is
  * freed as a 64 KiB mapping, the next iteration asks for 16 KiB, the sizes
  * do not match, and every round pays a fresh mmap.  Measured on 200 rounds
  * of the realloc-grow loop: 17 mmaps and 9 munmaps before the reservation
- * existed, 214 and 587 with it and no shrink, 17 and 9 again with it.
+ * existed, 214 and 587 with it and no restore, 17 and 9 again with it.
  *
- * Both syscalls are needed and neither is enough on its own.  madvise drops
- * the pages, which is what the RSS is; mprotect takes the access away,
- * without which the guard tail of any block that had ever grown would be
- * writable for the rest of the mapping's life.
+ * GROWN, and both syscalls are needed.  madvise drops the pages, which is
+ * what the RSS is; mprotect takes the access away, without which the guard
+ * tail of any block that had ever grown would be writable for the rest of
+ * the mapping's life.
+ *
+ * TRIMMED by a realloc down, and only the mprotect is needed, because
+ * big_trim has already dropped the pages: this restores the access and
+ * nothing else.  It is not optional either -- see the 33% above.
  */
-static void big_shrink(struct hdr *h)
+static void big_restore(struct hdr *h)
 {
-	char *from = (char *)h->map_base + h->commit0;
-	size_t n = h->commit - h->commit0;
+	char *base = (char *)h->map_base;
 
-	madvise(from, n, MADV_DONTNEED);
-	if (mprotect(from, n, PROT_NONE) == 0)
-		h->commit = h->commit0;
+	if (h->commit > h->commit0) {
+		madvise(base + h->commit0, h->commit - h->commit0,
+			MADV_DONTNEED);
+		if (mprotect(base + h->commit0, h->commit - h->commit0,
+			     PROT_NONE) == 0)
+			h->commit = h->commit0;
+	} else if (h->commit < h->commit0) {
+		if (mprotect(base + h->commit, h->commit0 - h->commit,
+			     PROT_READ | PROT_WRITE) == 0)
+			h->commit = h->commit0;
+	}
 }
 
 static size_t usable(struct hdr *h)
@@ -1152,8 +1219,8 @@ void free(void *p)
 	if (h->cls == CLS_LARGE) {
 		void *b = h->map_base;
 		size_t l = h->map_len;
-		if (h->commit > h->commit0)
-			big_shrink(h);
+		if (h->commit != h->commit0)
+			big_restore(h);
 		int keep = h->cached && spancache_put(b, l, h->commit);
 		/* The header is inside the mapping, so invalidate the magic before
 		 * letting go of it. A cached mapping that still says MAGIC would be
@@ -1243,11 +1310,9 @@ void *realloc(void *p, size_t size)
 		if (size <= MAXSMALL && cls_of(size) == h->cls)
 			return p;
 	} else if (size <= old) {
-		/* shortcut: shrinking a large block in place keeps the whole
-		 * mapping resident - realloc(p_1MB, 100) still holds 1 MB.
-		 * Ceiling: read-the-file-then-trim-the-buffer code keeps peak
-		 * footprint forever.  Upgrade path: munmap the pages past the
-		 * new end, which is safe because the header stays in page 0. */
+		lock();
+		big_trim(h, p, size);
+		unlock();
 		return p;
 	}
 

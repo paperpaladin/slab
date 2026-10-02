@@ -633,9 +633,21 @@ mutant "a reserved tail that is mapped writable instead of PROT_NONE" "guard" \
 mutant "a reservation that is never taken" "guard" \
 	's|\tif (commit < RESERVE_MIN)|\tif (1)|'
 mutant "a grown block that keeps its grown size when freed" "guard" \
-	's|\t\tif (h->commit > h->commit0)|\t\tif (0)|'
-mutant "a shrink that drops the pages but leaves the tail writable" "guard" \
-	's|\tif (mprotect(from, n, PROT_NONE) == 0)|\tif (1)|'
+	's|\t\tif (h->commit != h->commit0)|\t\tif (0)|'
+mutant "a restore that drops the pages but leaves the tail writable" "guard" \
+	's@\t\t\t     PROT_NONE) == 0)@\t\t\t     PROT_READ \| PROT_WRITE) == 0)@'
+# And the same pair for realloc DOWN, which is a different function with the
+# same two syscalls in it: one for giving the pages back at all, one for
+# taking the access away as well.
+mutant "a realloc down that keeps the whole mapping resident" "guard" \
+	's|\t\tbig_trim(h, p, size);|\t\t(void)0;|'
+mutant "a trim that drops the pages but leaves them writable" "guard" \
+	's@\tif (mprotect((char \*)h->map_base + want, h->commit - want,@\tif (0 \&\& mprotect((char *)h->map_base + want, h->commit - want,@'
+# A trimmed block that is not restored costs nothing visible and 33% of the
+# CPython replay. The suite asserts no timings, so what it checks instead is
+# the mechanism: the mapping has to come back out of the span cache.
+mutant "a trimmed block that never goes back to its mapped size" "guard" \
+	's|\t} else if (h->commit < h->commit0) {|\t} else if (0) {|'
 
 # Span reclamation.  The fourth is the one that matters most: a span
 # madvise()d while objects in it are still live is silent corruption, and it
