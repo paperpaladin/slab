@@ -127,6 +127,8 @@ unit() {
 unit "semantics (alignment, calloc, realloc, memalign, no-overlap)" \
 	./t/stress check
 unit "stress: 3M random ops, byte pattern verified"  ./t/stress stress 3000000
+unit "stress: 4 threads, 400k ops each, cross-thread free" \
+	./t/stress thread 400000
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
