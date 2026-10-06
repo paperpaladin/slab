@@ -179,13 +179,17 @@ static struct hdr *span_new(unsigned cls)
 /* Pop the class's free list; failing that, bump-allocate the next never-used
  * object out of the class's current span.  Objects start at offset HDR and
  * every class size is a multiple of 16, so every object in a 64 KiB-aligned
- * span is 16-byte aligned. */
-static void *alloc_small(unsigned cls)
+ * span is 16-byte aligned.
+ *
+ * *fresh is set if the memory has never been handed out before, i.e. it is
+ * still the zero page mmap gave us - calloc uses that to skip the memset. */
+static void *alloc_small(unsigned cls, int *fresh)
 {
 	struct klass *k = &klass[cls];
 	void *p = k->freelist;
 	if (p) {
 		k->freelist = *(void **)p;
+		*fresh = 0;
 		return p;
 	}
 	struct hdr *h = k->cur;
@@ -197,6 +201,7 @@ static void *alloc_small(unsigned cls)
 	}
 	p = (char *)h + h->bump;
 	h->bump += cls_size[cls];
+	*fresh = 1;
 	return p;
 }
 
@@ -246,6 +251,7 @@ static size_t usable(struct hdr *h)
 void *malloc(size_t size)
 {
 	void *p;
+	int fresh;
 
 	if (size == 0)
 		size = 1;             /* a unique freeable pointer, as is customary */
@@ -256,7 +262,7 @@ void *malloc(size_t size)
 		unlock();
 	} else {
 		lock();
-		p = alloc_small(cls_of(size));
+		p = alloc_small(cls_of(size), &fresh);
 		unlock();
 	}
 	if (!p)
@@ -297,9 +303,22 @@ void *calloc(size_t n, size_t m)
 {
 	if (m && n > SIZE_MAX / m) { errno = ENOMEM; return NULL; }
 	size_t size = n * m;
-	void *p = malloc(size);
-	if (p && size <= MAXSMALL)
-		memset(p, 0, size);   /* large blocks are fresh mmap, already zero */
+	void *p;
+
+	if (size == 0)
+		size = 1;
+	if (size > MAXSMALL)
+		return malloc(size);       /* fresh mmap: already zero */
+
+	int fresh;
+	lock();
+	p = alloc_small(cls_of(size), &fresh);
+	unlock();
+	if (!p) { errno = ENOMEM; return NULL; }
+	/* A bump-allocated object has never been written, and spans are never
+	 * recycled across classes, so it is still the kernel's zero page. */
+	if (!fresh)
+		memset(p, 0, size);
 	return p;
 }
 
