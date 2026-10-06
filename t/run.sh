@@ -130,5 +130,38 @@ unit "stress: 3M random ops, byte pattern verified"  ./t/stress stress 3000000
 unit "stress: 4 threads, 400k ops each, cross-thread free" \
 	./t/stress thread 400000
 
+# The same two must also pass against glibc malloc: if they do not, the
+# oracle is wrong rather than slab.
+if ./t/stress check >"$T/g.out" 2>&1 && ./t/stress stress 300000 >>"$T/g.out" 2>&1; then
+	ok "oracle agrees with glibc malloc"
+else
+	bad "oracle fails against glibc malloc - the test is wrong, not slab"
+	head -4 "$T/g.out" | sed 's/^/        /'
+fi
+
+# Footprint.  slab never returns memory to the OS (see the shortcut note in
+# slab.c), so this is the ceiling made measurable rather than a pass we
+# expect to be tight.
+rss=$(python3 - "$SLAB" <<'PY'
+import os, resource, subprocess, sys
+prog = ["python3", "-c",
+        "d=[bytearray(i%4096) for i in range(60000)]\n"
+        "d=[x for i,x in enumerate(d) if i%3]\n"
+        "print(len(d))"]
+def run(env):
+    e = dict(os.environ); e.update(env)
+    subprocess.run(prog, env=e, stdout=subprocess.DEVNULL)
+    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+a = run({})
+b = run({"LD_PRELOAD": sys.argv[1]})
+print("%.2f" % (b / a))
+PY
+)
+if python3 -c "import sys; sys.exit(0 if float('$rss') < 3.0 else 1)"; then
+	ok "peak RSS ${rss}x glibc on a churn workload (limit 3.0x)"
+else
+	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
