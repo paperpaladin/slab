@@ -10,8 +10,8 @@
 # exercise far more allocation patterns than any suite we would write.
 #
 # Tier 2 is t/stress, which checks the things output comparison cannot see:
-# alignment, calloc zeroing, realloc content preservation, and that no two
-# live allocations overlap.
+# alignment, calloc zeroing, realloc content preservation, and - via a byte
+# pattern per block - that no two live allocations overlap.
 #
 set -u
 
@@ -126,6 +126,7 @@ unit() {
 
 unit "semantics (alignment, calloc, realloc, memalign, no-overlap)" \
 	./t/stress check
+unit "stress: 3M random ops, byte pattern verified"  ./t/stress stress 3000000
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
