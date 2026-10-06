@@ -109,6 +109,13 @@ static char  *arena_cur, *arena_end;
  * initialisation and the pthread symbols are things we would rather not
  * touch this early in process startup.
  */
+/* shortcut: no pthread_atfork handler, so a fork() that races a thread
+ * holding this lock leaves the child with a lock nobody will ever release,
+ * and the child's first malloc hangs.  Ceiling: multithreaded programs that
+ * fork() without exec()ing.  fork-then-exec is fine, because exec replaces
+ * the whole image.  Upgrade path: register a handler that re-initialises lk
+ * in the child - cheap, but it needs pthread_atfork resolved at load time,
+ * which is exactly the startup window we are trying not to touch. */
 static volatile int lk;
 
 static void lock(void)
@@ -381,11 +388,22 @@ void *realloc(void *p, size_t size)
 		return NULL;
 	}
 	/* In-place when the request still lands in the same class, and for
-	 * large blocks when it still fits the mapping we already have. */
+	 * large blocks when it still fits the mapping we already have.
+	 * shortcut: no mremap for the large grow case - mremap(MREMAP_MAYMOVE)
+	 * can return an address that is not SPAN_SIZE-aligned, which would
+	 * break the AND-mask header lookup.  Ceiling: growing a 1 MB buffer by
+	 * doubling costs a full copy each time where glibc gets a page-table
+	 * remap.  Upgrade path: reserve a PROT_NONE guard tail per large
+	 * mapping and mprotect it in, so growth never needs to move. */
 	if (small) {
 		if (size <= MAXSMALL && cls_of(size) == h->cls)
 			return p;
 	} else if (size <= old) {
+		/* shortcut: shrinking a large block in place keeps the whole
+		 * mapping resident - realloc(p_1MB, 100) still holds 1 MB.
+		 * Ceiling: read-the-file-then-trim-the-buffer code keeps peak
+		 * footprint forever.  Upgrade path: munmap the pages past the
+		 * new end, which is safe because the header stays in page 0. */
 		return p;
 	}
 
@@ -435,3 +453,27 @@ void *memalign(size_t align, size_t size) { return aligned_alloc(align, size); }
 void *valloc(size_t size) { return aligned_alloc(PAGE, size); }
 
 void *pvalloc(size_t size) { return aligned_alloc(PAGE, round_up(size ? size : 1, PAGE)); }
+
+void *reallocarray(void *p, size_t n, size_t m)
+{
+	if (m && n > SIZE_MAX / m) { errno = ENOMEM; return NULL; }
+	return realloc(p, n * m);
+}
+
+size_t malloc_usable_size(void *p)
+{
+	if (!p)
+		return 0;
+	lock();
+	struct hdr *h = hdr_of(p);
+	size_t u = h ? usable(h) : 0;
+	unlock();
+	return u;
+}
+
+/* glibc's hooks and knobs.  Programs call these unconditionally; answering
+ * "did nothing, successfully" is better than letting the real ones run
+ * against an arena we are not using. */
+int mallopt(int opt, int val) { (void)opt; (void)val; return 1; }
+int malloc_trim(size_t pad) { (void)pad; return 0; }
+void malloc_stats(void) { }
