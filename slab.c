@@ -217,13 +217,48 @@ static unsigned cls_of(size_t size)
 	return 8 + (b - 3) * 4 + (unsigned)((n - 1 - ((size_t)1 << b)) >> (b - 2));
 }
 
-/* Large allocations keep the original scheme: one region each, header at the
- * span-aligned base, payload at base + HDR, so masking the payload pointer
- * lands on the header exactly as it does for a span of small objects. */
-static void *alloc_big(size_t size)
+/*
+ * Large / over-aligned allocations: one mmap each, with a span header in
+ * front so free() finds them by the same AND-mask as everything else.
+ *
+ * `align` <= 16 is the plain large case: header at the region base, payload
+ * at base+HDR, region base forced SPAN_SIZE-aligned so masking the payload
+ * pointer lands on the header.
+ *
+ * 32 <= align < SPAN_SIZE: same, payload pushed up to the first aligned
+ * offset.  Still inside the first span, so masking still works.
+ *
+ * align >= SPAN_SIZE: the payload is itself span-aligned, so there is no
+ * room for a header below it *in its own span* - masking would return the
+ * payload.  We exploit exactly that: a pointer from the small or plain-large
+ * path is never span-aligned (it always sits at least HDR bytes into a
+ * span), so `p == (p & ~SPAN_MASK)` is a precise, O(1) signal that the
+ * header is one span lower down.  No side table, no search.
+ */
+static void *alloc_big(size_t size, size_t align)
 {
-	size_t len = round_up(HDR + size, PAGE);
-	char *base = map_aligned(len);
+	size_t off, len;
+	char *base;
+
+	if (align >= SPAN_SIZE) {
+		len = round_up(align + SPAN_SIZE + size, PAGE);
+		base = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (base == MAP_FAILED)
+			return NULL;
+		char *p = (char *)round_up((uintptr_t)base + SPAN_SIZE, align);
+		struct hdr *h = (struct hdr *)(p - SPAN_SIZE);
+		h->magic = MAGIC;
+		h->cls = CLS_LARGE;
+		h->map_base = base;
+		h->map_len = len;
+		h->req = size;
+		return p;
+	}
+
+	off = align > HDR ? align : HDR;        /* align is a power of two */
+	len = round_up(off + size, PAGE);
+	base = map_aligned(len);
 	if (!base)
 		return NULL;
 	struct hdr *h = (struct hdr *)base;
@@ -231,13 +266,15 @@ static void *alloc_big(size_t size)
 	h->cls = CLS_LARGE;
 	h->map_base = base;
 	h->map_len = len;
-	h->req = len - HDR;
-	return base + HDR;
+	h->req = len - off;
+	return base + off;
 }
 
 static struct hdr *hdr_of(void *p)
 {
-	struct hdr *h = (struct hdr *)((uintptr_t)p & ~SPAN_MASK);
+	uintptr_t u = (uintptr_t)p;
+	struct hdr *h = (struct hdr *)((u & SPAN_MASK) ? (u & ~SPAN_MASK)
+						       : u - SPAN_SIZE);
 	return h->magic == MAGIC ? h : NULL;
 }
 
@@ -258,7 +295,7 @@ void *malloc(size_t size)
 	if (size > MAXSMALL) {
 		if (size > SIZE_MAX - SPAN_SIZE - PAGE) { errno = ENOMEM; return NULL; }
 		lock();
-		p = alloc_big(size);
+		p = alloc_big(size, 16);
 		unlock();
 	} else {
 		lock();
@@ -359,3 +396,42 @@ void *realloc(void *p, size_t size)
 	free(p);
 	return q;
 }
+
+int posix_memalign(void **out, size_t align, size_t size)
+{
+	if (align % sizeof(void *) || (align & (align - 1)) || align == 0)
+		return EINVAL;
+	if (size == 0)
+		size = 1;
+	void *p;
+	if (align <= 16 && size <= MAXSMALL) {
+		int fresh;
+		lock();
+		p = alloc_small(cls_of(size), &fresh);
+		unlock();
+	} else {
+		if (size > SIZE_MAX - align - SPAN_SIZE - PAGE)
+			return ENOMEM;
+		lock();
+		p = alloc_big(size, align);
+		unlock();
+	}
+	if (!p)
+		return ENOMEM;
+	*out = p;
+	return 0;
+}
+
+void *aligned_alloc(size_t align, size_t size)
+{
+	void *p;
+	int e = posix_memalign(&p, align, size);
+	if (e) { errno = e; return NULL; }
+	return p;
+}
+
+void *memalign(size_t align, size_t size) { return aligned_alloc(align, size); }
+
+void *valloc(size_t size) { return aligned_alloc(PAGE, size); }
+
+void *pvalloc(size_t size) { return aligned_alloc(PAGE, round_up(size ? size : 1, PAGE)); }
