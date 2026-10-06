@@ -9,6 +9,9 @@
 # corrupted, and these programs (ls, cat, grep, sort, wc, sh, python3, gcc)
 # exercise far more allocation patterns than any suite we would write.
 #
+# Tier 3 checks the oracle itself, by mutation: build a deliberately broken
+# slab and require the tier-2 check that owns that behaviour to reject it.
+#
 # Tier 2 is t/stress, which checks the things output comparison cannot see:
 # alignment, calloc zeroing, realloc content preservation, and - via a byte
 # pattern per block - that no two live allocations overlap.
@@ -162,6 +165,47 @@ if python3 -c "import sys; sys.exit(0 if float('$rss') < 3.0 else 1)"; then
 else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
 fi
+
+# ---------------------------------------------------------------- tier 3
+# Does tier 2 have teeth?  Build deliberately broken slabs and require the
+# oracle to reject each one.  A suite that cannot fail is not a suite, and
+# the only way to find out which it is, is to try.
+#
+# Each mutant names the mode that is *supposed* to catch it, not just "any
+# mode".  A broken calloc has to be caught by the targeted calloc check, not
+# incidentally by the random churn - otherwise the named check could be dead
+# code and the suite would still look green.
+#
+# Mutants are compiled with the same -fno-builtin flags as the real library,
+# so this tests the oracle and not the build.
+MUT="-std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-calloc
+     -fno-builtin-realloc -fno-builtin-free"
+
+mutant() {
+	name=$1
+	mode=$2
+	expr=$3
+	sed "$expr" slab.c >"$T/mut.c"
+	if cmp -s "$T/mut.c" slab.c; then
+		bad "self-check $name: sed did not apply (slab.c changed shape)"
+	elif ! gcc $MUT -o "$T/mut.so" "$T/mut.c" 2>"$T/m.err"; then
+		bad "self-check $name: mutant did not compile"
+		head -2 "$T/m.err" | sed 's/^/        /'
+	elif LD_PRELOAD="$T/mut.so" ./t/stress $mode >/dev/null 2>&1; then
+		bad "self-check: 'stress $mode' ACCEPTED $name"
+	else
+		ok "self-check: 'stress $mode' rejects $name"
+	fi
+}
+
+mutant "objects that overlap by 8 bytes" "stress 200000" \
+	's|\th->bump += cls_size\[cls\];|\th->bump += cls_size[cls] - 8;|'
+mutant "a calloc that never zeroes" "check" \
+	's|\t\tmemset(p, 0, size);|\t\t(void)0;|'
+mutant "a realloc that copies half the bytes" "check" \
+	's|\tmemcpy(q, p, old < size ? old : size);|\tmemcpy(q, p, (old < size ? old : size) / 2);|'
+mutant "a class index one too small for one octave" "check" \
+	's|>> (b - 2));|>> (b - 2)) - (b == 5);|'
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
