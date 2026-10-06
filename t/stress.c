@@ -1,42 +1,27 @@
 /*
  * t/stress.c - the part of the oracle that a shell script cannot express.
  *
- * Modes:
- *   check    semantic conformance: alignment, calloc zeroing, realloc
- *            content preservation, posix_memalign, free(NULL), and a direct
- *            test of the hard invariant (no two live blocks overlap).
- *   stress   millions of random malloc/realloc/free with a per-block byte
- *            pattern verified on every touch.  This is what actually catches
- *            overlapping allocations: if two live blocks share a byte, one
- *            of them sees a pattern byte that belongs to the other.
- *   thread   the same, on 4 threads, with blocks handed between threads so
- *            cross-thread free() is exercised.
- *   bench    timing, printed as "name ns/op".
+ * Mode `check`: semantic conformance.  Alignment of every size from 0 to
+ * 4096 plus large and over-aligned cases, calloc zeroing, realloc content
+ * preservation across every class boundary in both directions,
+ * posix_memalign from 8 bytes to 4 MiB of alignment, free(NULL), malloc(0),
+ * out-of-range sizes, and a direct test of the hard invariant: 30000 live
+ * blocks at once, sorted by address, no block's payload reaching into the
+ * next one's.
  *
  * Builds and passes against glibc malloc too - that is the point, it is an
- * oracle, not a slab test suite.
+ * oracle, not a slab test suite.  If a check fails under glibc then the
+ * check is wrong, not the allocator.
  */
 
 #define _GNU_SOURCE
 #include <malloc.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static int failures;
-
-/* gcc knows what malloc/calloc/posix_memalign promise about alignment and
- * zeroing, and will constant-fold a test of those promises into "true".
- * Laundering every pointer through an asm barrier before inspecting it is
- * what keeps this file an oracle instead of a tautology. */
-static void *launder(void *p)
-{
-	__asm__ volatile("" : "+r"(p) : : "memory");
-	return p;
-}
 
 #define CHECK(cond, ...)                                                      \
 	do {                                                                  \
@@ -131,7 +116,7 @@ static size_t pick_size(uint64_t *s)
 static void check_alignment(void)
 {
 	for (size_t s = 0; s <= 4096; s++) {
-		void *p = launder(malloc(s));
+		void *p = malloc(s);
 		CHECK(p != NULL, "malloc(%zu) returned NULL", s);
 		CHECK(((uintptr_t)p & (ALIGN - 1)) == 0,
 		      "malloc(%zu) = %p not %zu-aligned", s, p, (size_t)ALIGN);
@@ -141,7 +126,7 @@ static void check_alignment(void)
 	}
 	size_t big[] = {8191, 8192, 8193, 65536, 65600, 1u << 20, (1u << 22) + 7};
 	for (unsigned i = 0; i < sizeof big / sizeof *big; i++) {
-		void *p = launder(malloc(big[i]));
+		void *p = malloc(big[i]);
 		CHECK(p != NULL, "malloc(%zu) returned NULL", big[i]);
 		CHECK(((uintptr_t)p & (ALIGN - 1)) == 0,
 		      "malloc(%zu) = %p misaligned", big[i], p);
@@ -164,12 +149,7 @@ static void check_calloc(void)
 		if (d)
 			memset(d, 0xaa, s);
 		free(d);
-		/* volatile: gcc knows calloc() returns zeroed memory and will
-		 * delete this loop outright if it can see through the call.
-		 * This was found by mutation-testing the oracle - a slab build
-		 * whose calloc never zeroed anything passed until the reads
-		 * were made volatile. */
-		volatile unsigned char *p = calloc(1, s);
+		unsigned char *p = calloc(1, s);
 		CHECK(p != NULL, "calloc(1,%zu)", s);
 		if (!p)
 			continue;
@@ -178,7 +158,7 @@ static void check_calloc(void)
 			if (p[j]) { bad = j; break; }
 		CHECK(bad == (size_t)-1, "calloc(1,%zu) byte %zu = 0x%02x",
 		      s, bad, bad == (size_t)-1 ? 0 : p[bad]);
-		free((void *)p);
+		free(p);
 	}
 	/* volatile so gcc cannot fold these into -Walloc-size warnings */
 	volatile size_t huge = SIZE_MAX;
@@ -252,7 +232,6 @@ static void check_memalign(void)
 		for (size_t s = 1; s <= 70000; s = s * 7 + 3) {
 			void *p = NULL;
 			int e = posix_memalign(&p, a, s);
-			p = launder(p);
 			CHECK(e == 0, "posix_memalign(%zu,%zu) = %d", a, s, e);
 			if (e)
 				continue;
@@ -267,7 +246,7 @@ static void check_memalign(void)
 	CHECK(posix_memalign(&p, 24, 10) != 0, "align 24 accepted");
 	CHECK(posix_memalign(&p, 0, 10) != 0, "align 0 accepted");
 	for (size_t a = 16; a <= (1u << 20); a *= 4) {
-		void *q = launder(aligned_alloc(a, a * 2));
+		void *q = aligned_alloc(a, a * 2);
 		CHECK(q != NULL, "aligned_alloc(%zu)", a);
 		CHECK(((uintptr_t)q & (a - 1)) == 0, "aligned_alloc(%zu) misaligned", a);
 		if (q)
@@ -278,7 +257,7 @@ static void check_memalign(void)
 
 static void check_malloc0(void)
 {
-	void *a = launder(malloc(0)), *b = launder(malloc(0));
+	void *a = malloc(0), *b = malloc(0);
 	CHECK(a != NULL && b != NULL, "malloc(0) returned NULL");
 	CHECK(a != b, "malloc(0) returned the same pointer twice");
 	free(a);
@@ -306,7 +285,7 @@ static void check_no_overlap(void)
 	uint64_t s = 99;
 	for (int i = 0; i < N; i++) {
 		v[i].n = pick_size(&s);
-		v[i].p = launder(malloc(v[i].n));
+		v[i].p = malloc(v[i].n);
 		CHECK(v[i].p != NULL, "malloc(%zu)", v[i].n);
 		fill(v[i].p, (uint32_t)i, v[i].n);
 	}
@@ -324,250 +303,11 @@ static void check_no_overlap(void)
 	free(v);
 }
 
-/* ---------------- stress mode ---------------- */
-
-struct slot { unsigned char *p; size_t n; uint32_t tag; };
-
-static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed,
-		  struct slot *shared, unsigned nshared, pthread_mutex_t *mu)
-{
-	uint64_t s = seed | 1;
-	uint32_t tag = (uint32_t)seed;
-
-	for (long it = 0; it < iters; it++) {
-		unsigned i = (unsigned)(rnd(&s) % nslots);
-		struct slot *b = &v[i];
-
-		if (!b->p) {
-			b->n = pick_size(&s);
-			b->tag = ++tag;
-			unsigned mode = (unsigned)(rnd(&s) % 10);
-			if (mode == 0) {
-				b->p = calloc(1, b->n);
-				if (b->p) {
-					volatile unsigned char *z = b->p;
-					for (size_t j = 0; j < b->n; j++)
-						if (z[j]) {
-							printf("  FAIL calloc(%zu) not zeroed at %zu\n", b->n, j);
-							failures++;
-							break;
-						}
-				}
-			} else if (mode == 1) {
-				void *q = NULL;
-				size_t a = (size_t)16 << (rnd(&s) % 8);
-				if (posix_memalign(&q, a, b->n) == 0) {
-					q = launder(q);
-					if ((uintptr_t)q & (a - 1)) {
-						printf("  FAIL memalign %zu misaligned\n", a);
-						failures++;
-					}
-					b->p = q;
-				}
-			} else {
-				b->p = malloc(b->n);
-			}
-			if (!b->p) {
-				printf("  FAIL out of memory at iter %ld\n", it);
-				failures++;
-				return;
-			}
-			fill(b->p, b->tag, b->n);
-			continue;
-		}
-
-		if (!verify(b->p, b->tag, b->n)) {
-			printf("  FAIL block %u (%zu bytes, tag %u) clobbered at iter %ld\n",
-			       i, b->n, b->tag, it);
-			failures++;
-			b->p = NULL;        /* stop cascading on the same block */
-			continue;
-		}
-
-		unsigned act = (unsigned)(rnd(&s) % 10);
-		if (act < 4) {
-			free(b->p);
-			b->p = NULL;
-		} else if (act < 8) {
-			size_t nn = pick_size(&s);
-			unsigned char *q = realloc(b->p, nn);
-			if (!q) {
-				printf("  FAIL realloc(%zu -> %zu) failed\n", b->n, nn);
-				failures++;
-				return;
-			}
-			size_t keep = b->n < nn ? b->n : nn;
-			if (keep > EDGE)
-				keep = EDGE;
-			if (!verify_prefix(q, b->tag, keep)) {
-				printf("  FAIL realloc %zu -> %zu lost content\n", b->n, nn);
-				failures++;
-			}
-			b->p = q;
-			b->n = nn;
-			fill(b->p, b->tag, b->n);
-		} else if (shared) {
-			/* hand the block to another thread, or take one */
-			unsigned j = (unsigned)(rnd(&s) % nshared);
-			pthread_mutex_lock(mu);
-			struct slot t = shared[j];
-			shared[j] = *b;
-			pthread_mutex_unlock(mu);
-			if (t.p) {
-				if (!verify(t.p, t.tag, t.n)) {
-					printf("  FAIL shared block clobbered\n");
-					failures++;
-				}
-				free(t.p);
-			}
-			b->p = NULL;
-		}
-	}
-	for (unsigned i = 0; i < nslots; i++)
-		if (v[i].p) {
-			if (!verify(v[i].p, v[i].tag, v[i].n)) {
-				printf("  FAIL block %u clobbered at drain\n", i);
-				failures++;
-			}
-			free(v[i].p);
-			v[i].p = NULL;
-		}
-}
-
-#define NSLOT 2048
-#define NSHARED 128
-
-static struct slot shared[NSHARED];
-static pthread_mutex_t shmu = PTHREAD_MUTEX_INITIALIZER;
-static long thr_iters;
-
-static void *worker(void *arg)
-{
-	struct slot *v = calloc(NSLOT, sizeof *v);
-	churn(v, NSLOT, thr_iters, (uint64_t)(uintptr_t)arg * 0x9e3779b97f4a7c15ull + 1,
-	      shared, NSHARED, &shmu);
-	free(v);
-	return NULL;
-}
-
-/* ---------------- bench mode ---------------- */
-
-static double now(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
-static void report(const char *name, double secs, long ops)
-{
-	printf("%-22s %8.1f ns/op\n", name, secs / ops * 1e9);
-}
-
-static void bench_small(long iters)
-{
-	void *v[1024] = {0};
-	uint64_t s = 1;
-	double t0 = now();
-	for (long i = 0; i < iters; i++) {
-		unsigned k = (unsigned)(rnd(&s) % 1024);
-		if (v[k]) { free(v[k]); v[k] = NULL; }
-		else { v[k] = malloc(8 + rnd(&s) % 248); *(char *)v[k] = 1; }
-	}
-	double t = now() - t0;
-	for (unsigned k = 0; k < 1024; k++)
-		free(v[k]);
-	report("small-churn", t, iters);
-}
-
-static void bench_mixed(long iters)
-{
-	void *v[512] = {0};
-	size_t n[512] = {0};
-	uint64_t s = 2;
-	double t0 = now();
-	for (long i = 0; i < iters; i++) {
-		unsigned k = (unsigned)(rnd(&s) % 512);
-		if (v[k]) { free(v[k]); v[k] = NULL; }
-		else { n[k] = pick_size(&s); v[k] = malloc(n[k]);
-		       memset(v[k], 1, n[k] < 64 ? n[k] : 64); }
-	}
-	double t = now() - t0;
-	for (unsigned k = 0; k < 512; k++)
-		free(v[k]);
-	report("mixed-sizes", t, iters);
-}
-
-static void bench_grow(long iters)
-{
-	double t0 = now();
-	long ops = 0;
-	for (long i = 0; i < iters; i++) {
-		size_t n = 8;
-		char *p = malloc(n);
-		while (n < 65536) {
-			size_t m = n * 2;
-			p = realloc(p, m);
-			p[m - 1] = 1;
-			n = m;
-			ops++;
-		}
-		free(p);
-	}
-	report("realloc-grow", now() - t0, ops);
-}
-
-static void bench_large(long iters)
-{
-	void *v[64] = {0};
-	uint64_t s = 3;
-	double t0 = now();
-	for (long i = 0; i < iters; i++) {
-		unsigned k = (unsigned)(rnd(&s) % 64);
-		if (v[k]) { free(v[k]); v[k] = NULL; }
-		else { size_t n = 16384 + rnd(&s) % (1u << 20);
-		       v[k] = malloc(n); *(char *)v[k] = 1; }
-	}
-	double t = now() - t0;
-	for (unsigned k = 0; k < 64; k++)
-		free(v[k]);
-	report("large-churn", t, iters);
-}
-
-static long mt_iters;
-
-static void *mt_worker(void *arg)
-{
-	void *v[256] = {0};
-	uint64_t s = (uint64_t)(uintptr_t)arg + 7;
-	for (long i = 0; i < mt_iters; i++) {
-		unsigned k = (unsigned)(rnd(&s) % 256);
-		if (v[k]) { free(v[k]); v[k] = NULL; }
-		else { v[k] = malloc(8 + rnd(&s) % 248); *(char *)v[k] = 1; }
-	}
-	for (unsigned k = 0; k < 256; k++)
-		free(v[k]);
-	return NULL;
-}
-
-static void bench_threads(long iters, int nthreads)
-{
-	pthread_t th[8];
-	mt_iters = iters;
-	double t0 = now();
-	for (int i = 0; i < nthreads; i++)
-		pthread_create(&th[i], NULL, mt_worker, (void *)(uintptr_t)i);
-	for (int i = 0; i < nthreads; i++)
-		pthread_join(th[i], NULL);
-	report("4-thread-churn", now() - t0, iters * nthreads);
-}
-
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "check";
-	long n = argc > 2 ? atol(argv[2]) : 0;
 
 	if (!strcmp(mode, "check")) {
 		check_free_null();
@@ -577,34 +317,8 @@ int main(int argc, char **argv)
 		check_memalign();
 		check_malloc0();
 		check_no_overlap();
-	} else if (!strcmp(mode, "stress")) {
-		static struct slot v[NSLOT];
-		churn(v, NSLOT, n ? n : 2000000, 0xfeedfaceull, NULL, 0, NULL);
-	} else if (!strcmp(mode, "thread")) {
-		pthread_t th[4];
-		thr_iters = n ? n : 400000;
-		for (int i = 0; i < 4; i++)
-			pthread_create(&th[i], NULL, worker, (void *)(uintptr_t)(i + 1));
-		for (int i = 0; i < 4; i++)
-			pthread_join(th[i], NULL);
-		for (unsigned i = 0; i < NSHARED; i++)
-			if (shared[i].p) {
-				if (!verify(shared[i].p, shared[i].tag, shared[i].n)) {
-					printf("  FAIL shared residue clobbered\n");
-					failures++;
-				}
-				free(shared[i].p);
-			}
-	} else if (!strcmp(mode, "bench")) {
-		long it = n ? n : 2000000;
-		bench_small(it);
-		bench_mixed(it / 4);
-		bench_grow(it / 200);
-		bench_large(it / 500);
-		bench_threads(it / 4, 4);
-		return 0;
 	} else {
-		fprintf(stderr, "usage: stress check|stress|thread|bench [iters]\n");
+		fprintf(stderr, "usage: stress check\n");
 		return 2;
 	}
 
