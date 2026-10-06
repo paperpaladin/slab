@@ -101,11 +101,11 @@ static char  *arena_cur, *arena_end;
 
 /*
  * shortcut: one global spinlock for the whole allocator, no per-thread
- * caches.  Ceiling: throughput collapses once more than about two threads
- * allocate concurrently, because every operation serialises on one cache
- * line.  Upgrade path: a per-thread magazine of ~64 objects per class,
- * flushed to a global list in batches, which removes the lock from the hot
- * path entirely.  A spinlock rather than pthread_mutex_t because mutex
+ * caches.  Ceiling: measured 16x slower than glibc at 4 threads, and 6x
+ * slower than slab's own single-threaded number, because every operation
+ * serialises on one cache line (see README Benchmarks).  Upgrade path: a
+ * per-thread magazine of ~64 objects per class, flushed to a global list in
+ * batches, which removes the lock from the hot path entirely.  A spinlock rather than pthread_mutex_t because mutex
  * initialisation and the pthread symbols are things we would rather not
  * touch this early in process startup.
  */
