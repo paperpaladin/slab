@@ -80,10 +80,15 @@ Ranked by how much it would embarrass us to fail it.
 6. **The oracle checked against glibc.** The same stress and semantic tests
    run against glibc `malloc`. If they fail there, the test is wrong, not
    slab.
-7. **Mutation self-check.** `make test` builds a slab whose objects overlap
-   by 8 bytes and asserts the stress test rejects it. A suite that cannot
-   fail is not a suite -- and this is not hypothetical: it is how we found
-   that gcc was deleting the `calloc` zero-check as a provable tautology.
+7. **Mutation self-check.** `make test` builds four deliberately broken
+   slabs -- overlapping objects, a `calloc` that never zeroes, a `realloc`
+   that copies half the bytes, a class index one too small for one octave --
+   and requires each to be rejected *by the check that owns that behaviour*,
+   not merely by some check somewhere. A suite that cannot fail is not a
+   suite, and this is not hypothetical: it is how we found that gcc was
+   deleting the `calloc` zero-check as a provable tautology, and the
+   ownership requirement is what made it visible rather than masked by the
+   fuzzer catching it incidentally.
 8. **Footprint.** Peak RSS under the preload compared against glibc on a
    churn workload, bounded at 3x. Makes the "never returns memory to the OS"
    shortcut a measured number rather than a footnote.
@@ -104,22 +109,64 @@ Ranked by how much it would embarrass us to fail it.
 
 ## Commit sequence
 
-- [x] The allocator: spans, size classes, free lists, large-via-mmap
-      - why: the whole design hinges on one decision -- metadata at a
-        64 KiB-aligned span base instead of a per-object header -- so it is
-        not separable into smaller commits that build and run.
-- [x] The oracle: `t/stress.c`, `t/run.sh`, `Makefile`
-      - why: the allocator is worthless without evidence it does not
-        corrupt memory, and the evidence has to be real programs rather
-        than our own idea of what a program does.
-- [x] Harden the oracle against the compiler
-      - why: mutation testing showed gcc was constant-folding the `calloc`
-        zero-check and the alignment checks into `true`, because it knows
-        what the standard promises. A test that the optimiser can prove
-        tests nothing.
-- [x] Benchmarks and documentation
-      - why: the numbers that matter are the ones where we lose, and they
-        are only credible if measured and published rather than estimated.
+- [x] A correct allocator with one mmap per allocation
+      - why: establishes the span-aligned header lookup and the re-entrancy
+        constraints with nothing else in the way.  Correct, runs real
+        programs, and costs a page per allocation - everything after it
+        removes that cost without changing the behaviour.
+- [x] Size classes, spans carved from arenas, and the global lock
+      - why: the lock belongs in the same commit as the first shared mutable
+        state, not before it.  Also where gcc was caught rewriting
+        malloc+memset into a recursive call to our own calloc.
+- [x] Per-class free lists, threaded through the dead objects
+      - why: the second half of the no-per-object-header argument - the size
+        comes from the span, the list linkage comes from the corpse.
+- [x] calloc skips the memset when the page is provably still zero
+      - why: the proof depends on three separate facts about spans, two of
+        which are consequences of never returning memory to the OS, so it
+        has to be written down next to the code.
+- [x] posix_memalign and the aligned family, without a side table
+      - why: huge alignments make the payload span-aligned, which collides
+        with the header lookup.  The collision is turned into the signal.
+- [x] Finish the glibc surface, and write down what is not fixed
+      - why: mallopt and friends must exist or glibc's versions run against
+        an arena we are not using; and the remaining ceilings need to be
+        recorded before anything is tested, not after.
+- [x] t/stress.c: semantic conformance, and the hard invariant tested directly
+      - why: the contract checks output comparison can never see, plus a
+        head-on test of the no-overlap invariant rather than waiting for a
+        symptom.
+- [x] t/run.sh: real programs under LD_PRELOAD, and `make test`
+      - why: the only tier that really matters.  ls, cat, grep, sort, wc, a
+        shell pipeline, CPython and gcc are a better corpus than anything
+        we would write.
+- [x] t/stress.c: the byte-pattern churn
+      - why: overlapping allocations are silent and surface far from their
+        cause; a per-block pattern is what makes them local and immediate.
+- [x] t/stress.c: four threads, and blocks that cross between them
+      - why: the first thing in the repo that exercises the lock at all, and
+        cross-thread free is the case a per-thread cache would get wrong.
+- [x] t/run.sh: run the oracle against glibc, and measure the footprint
+      - why: guards against the suite drifting into a description of slab;
+        and turns "peak RSS is sticky" from an assertion into 1.08x.
+- [x] t/run.sh: mutation self-check - RED, it indicts the oracle
+      - why: `make test` fails at this commit on purpose.  A slab whose
+        calloc never zeroes passes the targeted calloc check, because gcc
+        proved the zero-checking loop could not observe a nonzero byte and
+        deleted it.
+- [x] Stop the compiler from deleting the oracle - GREEN
+      - why: asm-volatile pointer laundering, volatile reads, and
+        -fno-builtin on the oracle.  Three layers because any one of them is
+        a bet on compiler behaviour, and those bets lose silently.
+- [x] A benchmark harness, and the measured number behind the lock's ceiling
+      - why: a shortcut: comment claiming a ceiling nobody measured reads
+        like a finding and is worth less than no comment.
+- [x] README: the numbers, including the four benchmarks slab loses
+      - why: admitting a 72x loss with the reason is more credible than
+        claiming the one win.
+- [x] PLAN: this file
+      - why: the ranked backlog is derived from the benchmark, so it comes
+        after it.
 
 ### Milestone 1 -- the things the benchmarks say to fix, in order of payoff
 
