@@ -21,7 +21,10 @@ libslab.so: slab.c
 t/stress: t/stress.c
 	$(CC) $(TFLAGS) -o $@ $<
 
+test: all
+	@t/run.sh
+
 clean:
 	rm -f libslab.so t/stress
 
-.PHONY: all clean
+.PHONY: all test clean
