@@ -34,6 +34,16 @@
 
 static int failures;
 
+/* gcc knows what malloc/calloc/posix_memalign promise about alignment and
+ * zeroing, and will constant-fold a test of those promises into "true".
+ * Laundering every pointer through an asm barrier before inspecting it is
+ * what keeps this file an oracle instead of a tautology. */
+static void *launder(void *p)
+{
+	__asm__ volatile("" : "+r"(p) : : "memory");
+	return p;
+}
+
 #define CHECK(cond, ...)                                                      \
 	do {                                                                  \
 		if (!(cond)) {                                                \
@@ -127,7 +137,7 @@ static size_t pick_size(uint64_t *s)
 static void check_alignment(void)
 {
 	for (size_t s = 0; s <= 4096; s++) {
-		void *p = malloc(s);
+		void *p = launder(malloc(s));
 		CHECK(p != NULL, "malloc(%zu) returned NULL", s);
 		CHECK(((uintptr_t)p & (ALIGN - 1)) == 0,
 		      "malloc(%zu) = %p not %zu-aligned", s, p, (size_t)ALIGN);
@@ -137,7 +147,7 @@ static void check_alignment(void)
 	}
 	size_t big[] = {8191, 8192, 8193, 65536, 65600, 1u << 20, (1u << 22) + 7};
 	for (unsigned i = 0; i < sizeof big / sizeof *big; i++) {
-		void *p = malloc(big[i]);
+		void *p = launder(malloc(big[i]));
 		CHECK(p != NULL, "malloc(%zu) returned NULL", big[i]);
 		CHECK(((uintptr_t)p & (ALIGN - 1)) == 0,
 		      "malloc(%zu) = %p misaligned", big[i], p);
@@ -160,7 +170,12 @@ static void check_calloc(void)
 		if (d)
 			memset(d, 0xaa, s);
 		free(d);
-		unsigned char *p = calloc(1, s);
+		/* volatile: gcc knows calloc() returns zeroed memory and will
+		 * delete this loop outright if it can see through the call.
+		 * This was found by mutation-testing the oracle - a slab build
+		 * whose calloc never zeroed anything passed until the reads
+		 * were made volatile. */
+		volatile unsigned char *p = calloc(1, s);
 		CHECK(p != NULL, "calloc(1,%zu)", s);
 		if (!p)
 			continue;
@@ -169,7 +184,7 @@ static void check_calloc(void)
 			if (p[j]) { bad = j; break; }
 		CHECK(bad == (size_t)-1, "calloc(1,%zu) byte %zu = 0x%02x",
 		      s, bad, bad == (size_t)-1 ? 0 : p[bad]);
-		free(p);
+		free((void *)p);
 	}
 	/* volatile so gcc cannot fold these into -Walloc-size warnings */
 	volatile size_t huge = SIZE_MAX;
@@ -243,6 +258,7 @@ static void check_memalign(void)
 		for (size_t s = 1; s <= 70000; s = s * 7 + 3) {
 			void *p = NULL;
 			int e = posix_memalign(&p, a, s);
+			p = launder(p);
 			CHECK(e == 0, "posix_memalign(%zu,%zu) = %d", a, s, e);
 			if (e)
 				continue;
@@ -257,7 +273,7 @@ static void check_memalign(void)
 	CHECK(posix_memalign(&p, 24, 10) != 0, "align 24 accepted");
 	CHECK(posix_memalign(&p, 0, 10) != 0, "align 0 accepted");
 	for (size_t a = 16; a <= (1u << 20); a *= 4) {
-		void *q = aligned_alloc(a, a * 2);
+		void *q = launder(aligned_alloc(a, a * 2));
 		CHECK(q != NULL, "aligned_alloc(%zu)", a);
 		CHECK(((uintptr_t)q & (a - 1)) == 0, "aligned_alloc(%zu) misaligned", a);
 		if (q)
@@ -268,7 +284,7 @@ static void check_memalign(void)
 
 static void check_malloc0(void)
 {
-	void *a = malloc(0), *b = malloc(0);
+	void *a = launder(malloc(0)), *b = launder(malloc(0));
 	CHECK(a != NULL && b != NULL, "malloc(0) returned NULL");
 	CHECK(a != b, "malloc(0) returned the same pointer twice");
 	free(a);
@@ -296,7 +312,7 @@ static void check_no_overlap(void)
 	uint64_t s = 99;
 	for (int i = 0; i < N; i++) {
 		v[i].n = pick_size(&s);
-		v[i].p = malloc(v[i].n);
+		v[i].p = launder(malloc(v[i].n));
 		CHECK(v[i].p != NULL, "malloc(%zu)", v[i].n);
 		fill(v[i].p, (uint32_t)i, v[i].n);
 	}
@@ -335,8 +351,9 @@ static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed,
 			if (mode == 0) {
 				b->p = calloc(1, b->n);
 				if (b->p) {
+					volatile unsigned char *z = b->p;
 					for (size_t j = 0; j < b->n; j++)
-						if (b->p[j]) {
+						if (z[j]) {
 							printf("  FAIL calloc(%zu) not zeroed at %zu\n", b->n, j);
 							failures++;
 							break;
@@ -346,6 +363,7 @@ static void churn(struct slot *v, unsigned nslots, long iters, uint64_t seed,
 				void *q = NULL;
 				size_t a = (size_t)16 << (rnd(&s) % 8);
 				if (posix_memalign(&q, a, b->n) == 0) {
+					q = launder(q);
 					if ((uintptr_t)q & (a - 1)) {
 						printf("  FAIL memalign %zu misaligned\n", a);
 						failures++;
