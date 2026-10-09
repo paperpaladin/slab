@@ -83,7 +83,7 @@ static const uint32_t cls_size[NCLASS] = {
 struct hdr {
 	uint32_t magic;
 	uint16_t cls;        /* class index, or CLS_LARGE */
-	uint16_t pad;
+	uint16_t cached;     /* large: this mapping may go in the span cache */
 	uint32_t bump;       /* small: offset of next never-used object */
 	uint32_t cap;        /* small: offset one past the last object */
 	void    *map_base;   /* large: what to hand back to munmap */
@@ -100,6 +100,36 @@ struct klass {
 
 static struct klass klass[NCLASS];
 static char  *arena_cur, *arena_end;
+
+/*
+ * A cache of recently freed large mappings.
+ *
+ * Large-block churn measured 8x glibc, and nearly all of it is syscalls and
+ * page faults: every free was an munmap and every allocation a fresh mmap, so
+ * every block was faulted in from zero. glibc keeps freed blocks and hands
+ * them back. This does the same, for the plain-large path only.
+ *
+ * Matched on exact length. Large requests are rounded up to a page, so lengths
+ * cluster hard in practice, and exact matching keeps the lookup a short scan
+ * with no policy to get wrong. shortcut: a best-fit or size-class match would
+ * hit more often on a workload whose sizes drift; the ceiling is that a program
+ * cycling through many distinct sizes gets no reuse at all.
+ *
+ * Only the plain path is cached. The over-aligned path (align >= SPAN_SIZE)
+ * has a different geometry -- the header sits a whole span below a payload that
+ * is itself span-aligned -- so a mapping from one is not interchangeable with a
+ * request for the other, and the header records which kind it is rather than
+ * leaving that to be re-derived.
+ *
+ * The bound is on bytes, not entries. Sixteen mappings of a megabyte is a very
+ * different thing to sixteen of a page, and it is the bytes a program notices.
+ */
+#define SPANCACHE_N     16
+#define SPANCACHE_BYTES (64u * 1024u * 1024u)
+
+static struct { void *base; size_t len; } spancache[SPANCACHE_N];
+static int    nspan;
+static size_t spanbytes;
 
 /*
  * One global spinlock, guarding the class free lists and the arena.  Threads
@@ -419,10 +449,77 @@ static void *small(unsigned cls, int *fresh)
  * span), so `p == (p & ~SPAN_MASK)` is a precise, O(1) signal that the
  * header is one span lower down.  No side table, no search.
  */
-static void *alloc_big(size_t size, size_t align)
+/*
+ * Take a cached mapping of exactly `len` bytes, or NULL. Called with the lock
+ * held. The caller must treat the memory as dirty: it held someone else's data
+ * a moment ago, which is why calloc gets told.
+ */
+static void *spancache_take(size_t len, size_t *got)
+{
+	int best = -1;
+	for (int i = 0; i < nspan; i++) {
+		if (spancache[i].len < len || spancache[i].len > len + len / 4)
+			continue;
+		if (best < 0 || spancache[i].len < spancache[best].len)
+			best = i;
+	}
+	if (best < 0)
+		return NULL;
+	void *base = spancache[best].base;
+	*got = spancache[best].len;
+	spanbytes -= spancache[best].len;
+	spancache[best] = spancache[--nspan];
+	return base;
+}
+
+/*
+ * Keep a freed mapping, or say no. Called with the lock held; returns 0 if the
+ * caller still owns the mapping and must unmap it.
+ *
+ * Refusing is the normal case for anything big: a program that frees one
+ * 500MB block should not have 500MB quietly retained on the chance it asks
+ * again. The cap is why `len > SPANCACHE_BYTES` is rejected outright rather
+ * than evicting everything else to make room for it.
+ */
+static int spancache_put(void *base, size_t len)
+{
+	if (nspan == SPANCACHE_N || len > SPANCACHE_BYTES)
+		return 0;
+	while (spanbytes + len > SPANCACHE_BYTES) {
+		/* Evict the oldest-ish entry. There is no LRU here and the order is
+		 * whatever the swap-with-last removal left behind; with sixteen
+		 * entries matched on exact size, a real policy would be more code
+		 * than the hit rate justifies.
+		 * shortcut: no recency. Add it if a workload ever shows the cache
+		 * thrashing on a mix of sizes. */
+		if (nspan == 0)
+			return 0;
+		void *old = spancache[0].base;
+		size_t olen = spancache[0].len;
+		spancache[0] = spancache[--nspan];
+		spanbytes -= olen;
+		munmap(old, olen);
+	}
+	spancache[nspan].base = base;
+	spancache[nspan].len = len;
+	nspan++;
+	spanbytes += len;
+	return 1;
+}
+
+/*
+ * *fresh is set only when the memory has never been handed out before, which
+ * for a large block means it is still the zero pages mmap gave us. A mapping
+ * out of the span cache is NOT fresh -- it holds whatever the last owner left
+ * there -- and calloc has to memset it. Getting that wrong is a disclosure
+ * bug, not a performance one.
+ */
+static void *alloc_big(size_t size, size_t align, int *fresh)
 {
 	size_t off, len;
 	char *base;
+
+	*fresh = 1;
 
 	if (align >= SPAN_SIZE) {
 		len = round_up(align + SPAN_SIZE + size, PAGE);
@@ -437,12 +534,20 @@ static void *alloc_big(size_t size, size_t align)
 		h->map_base = base;
 		h->map_len = len;
 		h->req = size;
+		h->cached = 0;    /* different geometry; never interchangeable */
 		return p;
 	}
 
 	off = align > HDR ? align : HDR;        /* align is a power of two */
 	len = round_up(off + size, PAGE);
-	base = map_aligned(len);
+	size_t got = len;
+	base = spancache_take(len, &got);
+	if (base) {
+		*fresh = 0;
+		len = got;   /* we own all of it, and req below reflects that */
+	} else {
+		base = map_aligned(len);
+	}
 	if (!base)
 		return NULL;
 	struct hdr *h = (struct hdr *)base;
@@ -451,6 +556,7 @@ static void *alloc_big(size_t size, size_t align)
 	h->map_base = base;
 	h->map_len = len;
 	h->req = len - off;
+	h->cached = 1;
 	return base + off;
 }
 
@@ -479,7 +585,7 @@ void *malloc(size_t size)
 	if (size > MAXSMALL) {
 		if (size > SIZE_MAX - SPAN_SIZE - PAGE) { errno = ENOMEM; return NULL; }
 		lock();
-		p = alloc_big(size, 16);
+		p = alloc_big(size, 16, &fresh);
 		unlock();
 	} else {
 		p = small(cls_of(size), &fresh);
@@ -521,8 +627,15 @@ void free(void *p)
 	if (h->cls == CLS_LARGE) {
 		void *b = h->map_base;
 		size_t l = h->map_len;
+		int keep = h->cached && spancache_put(b, l);
+		/* The header is inside the mapping, so invalidate the magic before
+		 * letting go of it. A cached mapping that still says MAGIC would be
+		 * recognised by hdr_of() through a stale pointer, and free() would
+		 * cheerfully cache it a second time. */
+		h->magic = 0;
 		unlock();
-		munmap(b, l);
+		if (!keep)
+			munmap(b, l);
 		return;
 	}
 	/* The freed object is itself the free-list node: the smallest class is
@@ -541,10 +654,24 @@ void *calloc(size_t n, size_t m)
 
 	if (size == 0)
 		size = 1;
-	if (size > MAXSMALL)
-		return malloc(size);       /* fresh mmap: already zero */
-
 	int fresh;
+
+	if (size > MAXSMALL) {
+		if (size > SIZE_MAX - SPAN_SIZE - PAGE) { errno = ENOMEM; return NULL; }
+		lock();
+		p = alloc_big(size, 16, &fresh);
+		unlock();
+		if (!p) { errno = ENOMEM; return NULL; }
+		/* A fresh mmap is already zero. A mapping out of the span cache is
+		 * not: it holds what the last owner left in it. This used to be
+		 * `return malloc(size)` with the comment "fresh mmap: already
+		 * zero", which was true until the cache existed and would have been
+		 * a disclosure bug the moment it did. */
+		if (!fresh)
+			memset(p, 0, size);
+		return p;
+	}
+
 	p = small(cls_of(size), &fresh);
 	if (!p) { errno = ENOMEM; return NULL; }
 	/* A bump-allocated object has never been written, and spans are never
@@ -618,8 +745,9 @@ int posix_memalign(void **out, size_t align, size_t size)
 	} else {
 		if (size > SIZE_MAX - align - SPAN_SIZE - PAGE)
 			return ENOMEM;
+		int fresh;
 		lock();
-		p = alloc_big(size, align);
+		p = alloc_big(size, align, &fresh);
 		unlock();
 	}
 	if (!p)

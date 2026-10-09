@@ -26,7 +26,7 @@ object. That is the footprint benchmark slab wins, and it wins it by 39%.
 
 ## The oracle
 
-`make test` runs 30 checks in three tiers.
+`make test` runs 31 checks in three tiers.
 
 **Tier 1, which is the whole point:** real system binaries, run twice -- once
 normally, once with `LD_PRELOAD=./libslab.so` -- demanding that stdout,
@@ -88,7 +88,7 @@ ok    self-check: 'stress check' rejects a calloc that never zeroes
 ok    self-check: 'stress check' rejects a realloc that copies half the bytes
 ok    self-check: 'stress check' rejects a class index one too small for one octave
 
-30 passed, 0 failed
+31 passed, 0 failed
 ```
 
 ### What the oracle caught
@@ -164,17 +164,55 @@ All three slab columns come from one sitting, the "one lock" one being
 flags. Comparing a new number against a figure measured on a different day is
 how a change gets credit for the weather.
 
-| phase | glibc (ns/op) | slab, one lock | slab, magazines | ratio now |
-| --- | --- | --- | --- | --- |
-| `small-churn` -- 8-256 B, 1024 live slots | 14.0 (13.7-14.6) | 14.3 (14.0-15.4) | **13.6** (13.4-13.9) | 0.97x |
-| `mixed-sizes` -- 70/20/8/2% size mix to 256 KiB | **37.4** (35.6-39.5) | 116.9 (113.6-132.6) | 113.7 (111.3-124.1) | 3.0x slower |
-| `realloc-grow` -- doubling 8 B to 64 KiB | **50.3** (46.5-55.2) | 4065 (3930-4169) | 4098 (3778-4292) | **81x slower** |
-| `large-churn` -- 16 KiB-1 MiB, 64 live slots | **576** (512-602) | 4814 (4642-5825) | 4624 (4555-4856) | 8.0x slower |
-| `4-thread-churn` -- 8-256 B, 4 threads | 3.6 (3.4-5.2) | 74.8 (56.7-87.0) | 4.4 (4.2-6.3) | 1.2x slower |
+| phase | glibc (ns/op) | one lock | magazines | + span cache | ratio now |
+| --- | --- | --- | --- | --- | --- |
+| `small-churn` -- 8-256 B, 1024 live slots | 16.0 | 14.1 | 13.5 | **13.6** | 0.85x |
+| `mixed-sizes` -- 70/20/8/2% size mix to 256 KiB | **38.7** | 119.7 | 103.4 | 50.6 | 1.3x slower |
+| `realloc-grow` -- doubling 8 B to 64 KiB | **52.7** | 4276 | 3312 | 159 | 3.0x slower |
+| `large-churn` -- 16 KiB-1 MiB, 64 live slots | **582** | 4765 | 4684 | 2279 | 3.9x slower |
+| `4-thread-churn` -- 8-256 B, 4 threads | 3.9 | 5.2 | 3.5 | **3.5** | 0.90x |
 
-The magazines moved one row and left the other four where they were, which is
-what should happen: they take the lock off the small-object path, and nothing
-else in the table was waiting on the lock.
+Three columns of slab, all measured in one sitting, each one the commit before
+the next. The magazines moved exactly one row, which is what should happen:
+they take the lock off the small-object path and nothing else was waiting on
+the lock. The span cache moved three, because what those three had in common
+was syscalls.
+
+`realloc-grow` is the one to look at: 4276 ns/op to 159, a factor of 27,
+without touching `realloc` at all. Every doubling was an `mmap`, a `memcpy` and
+an `munmap`, and the `mmap` was the expensive part -- a fresh mapping is faulted
+in from zero one page at a time. Handing back a mapping that is already
+resident removes the faults, and the copy that remains is what the 3.0x is.
+
+### The span cache
+
+Freed large mappings are kept instead of unmapped, and handed back to the next
+request they fit. Sixteen of them, bounded at 64 MiB total rather than by
+count, because sixteen mappings of a megabyte is a very different thing from
+sixteen of a page and bytes are what a program notices.
+
+Matched **best-fit within 25%**, and that number was measured rather than
+chosen. Exact-length matching was tried first and is the obvious design: large
+requests are page-rounded so lengths cluster. It moved `realloc-grow` from
+4276 to 3312 and `large-churn` from 4765 to 4684 -- which is to say it did
+almost nothing for the row it was aimed at, because that benchmark picks random
+sizes between 16 KiB and 1 MiB and page-rounding leaves roughly 250 distinct
+lengths for a sixteen-entry cache to miss. Allowing up to 25% slack took the
+same row to 2279. The waste is bounded by that 25% and shows up as 1.10x glibc
+peak RSS on the footprint test, against a 3.0x limit.
+
+A recycled mapping is **dirty**, and that is the one thing here that is a
+correctness problem rather than a performance one. `calloc` used to be
+`return malloc(size)` for anything over 8 KiB, with the comment "fresh mmap:
+already zero" -- true until this cache existed, and a disclosure bug the moment
+it did. It now asks whether the mapping was fresh and `memset`s when it was
+not. Removing that check makes `calloc(1, 8193)` return the previous owner's
+bytes, and the targeted `calloc` check in the oracle says so.
+
+Only the plain-large path is cached. The over-aligned path puts its header a
+whole span below a payload that is itself span-aligned, so a mapping from one
+is not interchangeable with a request for the other; the header records which
+kind it is rather than leaving that to be re-derived at free time.
 
 Footprint, 2 million simultaneous live allocations, peak RSS divided by
 allocation count (includes an 8-byte index entry per allocation, so subtract
@@ -192,15 +230,14 @@ allocation count (includes an 8-byte index entry per allocation, so subtract
 This is the honest part. slab loses four of five timing benchmarks, two of
 them badly.
 
-- **`realloc`-grow, 72x slower.** This is the worst result in the suite and
-  it is entirely a missing feature. glibc grows a large block with
-  `mremap`, which is a page-table edit -- no copying. slab does a fresh
-  `mmap`, a full `memcpy` of the old contents, and a `munmap`, on every
-  doubling. It does that because `mremap(MREMAP_MAYMOVE)` can return an
-  address that is not 64 KiB-aligned, which would break the `AND`-mask
-  header lookup the whole design rests on. The fix is to reserve a
-  `PROT_NONE` tail per large mapping and `mprotect` it in, so growth never
-  has to move; that is the third item in `PLAN.md`.
+- **`realloc`-grow, 3.0x slower**, down from 81x. What is left is the `memcpy`:
+  glibc grows a large block with `mremap`, a page-table edit that copies
+  nothing. slab still allocates, copies and frees on every doubling, it just no
+  longer pays for a fresh mapping each time. `mremap(MREMAP_MAYMOVE)` can
+  return an address that is not 64 KiB-aligned, which would break the
+  `AND`-mask header lookup the whole design rests on, so the fix is a
+  `PROT_NONE` tail per large mapping with `mprotect` to grow into it. Still in
+  `PLAN.md`, now worth much less than it was.
 - **4-thread churn is a tie now, and was the worst row in the table.** Under
   one global lock it ran at 74.8 ns/op against glibc's 3.6 -- 21x, and 5x
   slower than slab's *own* single-threaded number, because every malloc and
@@ -209,14 +246,16 @@ them badly.
   and the row is 4.4 against 3.6. The ranges overlap (4.2-6.3 against
   3.4-5.2), so the honest claim is "about the same as glibc" rather than a
   win. The 21x is gone either way.
-- **Large-block churn, 7.7x slower.** glibc keeps freed large blocks in its
-  top chunk or its `mmap` cache and hands them straight back; slab calls
-  `munmap` on every free and `mmap` on every allocation, so every block is
-  faulted in from scratch. Three syscalls per allocation rather than one,
-  too, because `map_aligned` over-maps and trims to get 64 KiB alignment.
-- **Mixed sizes, 2.8x slower.** This is the previous row leaking into a
-  general workload: only 2% of the allocations in that phase exceed 8 KiB,
-  and they account for most of the time.
+- **Large-block churn, 3.9x slower**, down from 8.2x. The cache covers the
+  repeat cases; what remains is a cache miss, which still costs three syscalls
+  rather than one because `map_aligned` over-maps and trims to get 64 KiB
+  alignment. Reserving one span-aligned region up front and carving from it
+  with `MAP_FIXED` is the `PLAN.md` item that removes those two trimming
+  `munmap`s.
+- **Mixed sizes, 1.3x slower**, down from 3.1x. It was the previous two rows
+  leaking into a general workload -- only 2% of the allocations in that phase
+  exceed 8 KiB and they accounted for most of the time, which is why fixing
+  the large path moved this row by more than the small path ever did.
 - **Small-object churn is a tie.** slab's median is 8% ahead but the ranges
   overlap, so the honest claim is "about the same", not a win. The pop-from-
   free-list fast path is genuinely short -- a lock, a load, a store, an

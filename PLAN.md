@@ -187,11 +187,29 @@ Ranked by how much it would embarrass us to fail it.
         17x with the adoption removed. Keeping half the magazine on a drain
         was implemented, measured, found to be inside the noise on all five
         benchmarks, and deleted.
-- [ ] A free-span cache for large allocations: keep recently freed large
+- [x] A free-span cache for large allocations: keep recently freed large
       mappings instead of `munmap`ing them, matched by size.
       - why: large-block churn is 7.7x slower than glibc, which is almost
         all `mmap`/`munmap` syscalls and page faults glibc avoids by
         caching.
+      - done: three rows moved. realloc-grow 81x -> 3.0x, mixed-sizes
+        3.1x -> 1.3x, large-churn 8.2x -> 3.9x, all measured against the
+        previous commit in one sitting. "Matched by size" turned out to mean
+        best-fit within 25%, not exact: exact matching is the obvious design
+        and moved large-churn by 2%, because that benchmark picks random sizes
+        and page-rounding still leaves ~250 distinct lengths for a 16-entry
+        cache to miss. Bounded on bytes (64 MiB) rather than entries, and the
+        waste shows up as 1.10x glibc peak RSS against a 3.0x limit.
+      - the correctness half: a recycled mapping is dirty, and calloc was
+        `return malloc(size)` for anything over 8 KiB with the comment "fresh
+        mmap: already zero". True until this cache existed and a disclosure
+        bug the moment it did. Removing the memset makes calloc(1, 8193)
+        return the previous owner's 0xaa bytes and the targeted calloc check
+        catches it.
+      - measured from outside with strace, because "mappings are reused" is a
+        claim about syscalls and nothing in a program's output can see it:
+        200 large alloc/free cycles cost 601 munmaps before and 3 after, with
+        glibc at 2. Disabling the cache fails that assertion and nothing else.
 - [ ] Grow large blocks without copying: reserve a `PROT_NONE` tail per
       large mapping and `mprotect` it in on growth.
       - why: `realloc`-grow is 72x slower than glibc. Every doubling past
