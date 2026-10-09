@@ -170,10 +170,23 @@ Ranked by how much it would embarrass us to fail it.
 
 ### Milestone 1 -- the things the benchmarks say to fix, in order of payoff
 
-- [ ] Per-thread magazines: a small per-class cache of objects owned by one
+- [x] Per-thread magazines: a small per-class cache of objects owned by one
       thread, refilled and flushed in batches under the global lock.
       - why: the 4-thread benchmark is 16x slower than glibc, entirely
         because of lock contention. This is the single largest loss.
+      - done: 20.8x -> 1.2x, measured against the previous commit in the same
+        sitting; the other four benchmark rows did not move. The TLS the
+        feature needs is one eight-byte pointer with tls_model
+        initial-exec, which is the only model that cannot reach malloc
+        through __tls_get_addr. The magazines live in our own memory with a
+        registry that outlives every thread, and a dead thread's set is
+        adopted by the next thread to ask, tested with tgkill(tid, 0) --
+        pthread_key_create's destructor is the usual answer and is ruled out
+        because pthread_setspecific allocates. New thread-churn test: 1000
+        threads created and joined one at a time, peak RSS 1.00x glibc, and
+        17x with the adoption removed. Keeping half the magazine on a drain
+        was implemented, measured, found to be inside the noise on all five
+        benchmarks, and deleted.
 - [ ] A free-span cache for large allocations: keep recently freed large
       mappings instead of `munmap`ing them, matched by size.
       - why: large-block churn is 7.7x slower than glibc, which is almost
@@ -204,6 +217,14 @@ Ranked by how much it would embarrass us to fail it.
       helps or hurts.
       - why: 4 MiB arenas are exactly the shape THP wants; worth knowing
         whether the TLB win beats the zeroing cost.
+- [ ] Return a dead thread's magazines eagerly rather than on adoption.
+      - why: adoption bounds the stranded memory by peak thread count, not by
+        threads created, which is enough for a thread pool and not for a
+        program that peaks at 500 threads and then runs one. The honest
+        options are a pthread_key_create destructor behind a recursion guard
+        (pthread_setspecific allocates for high key indices) or a sweep of
+        the registry with tgkill whenever a refill is about to map a new
+        span.
 - [ ] A `pthread_atfork` child handler that re-initialises the lock.
       - why: a multithreaded program that `fork()`s without `exec()` can
         deadlock in the child's first `malloc` today.

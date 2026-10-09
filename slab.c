@@ -24,7 +24,8 @@
  * variable can call __tls_get_addr -> dlopen bookkeeping -> malloc -> us,
  * recursively), no pthread_once, no atexit.  The only libc calls here are
  * mmap, munmap, memcpy, memset, write, strlen and sched_yield, none of
- * which allocate.  There is also no initialisation step at all: every table
+ * which allocate (plus gettid and tgkill, reached through syscall(2) because
+ * glibc's wrappers for them are recent).  There is also no initialisation step at all: every table
  * below is either a compile-time constant or computed arithmetically, so
  * there is no "am I initialised yet" flag to race on and no init
  * re-entrancy window.
@@ -37,6 +38,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 /* shortcut: the page size is a compile-time 4096 rather than
@@ -100,14 +102,13 @@ static struct klass klass[NCLASS];
 static char  *arena_cur, *arena_end;
 
 /*
- * shortcut: one global spinlock for the whole allocator, no per-thread
- * caches.  Ceiling: measured 16x slower than glibc at 4 threads, and 6x
- * slower than slab's own single-threaded number, because every operation
- * serialises on one cache line (see README Benchmarks).  Upgrade path: a
- * per-thread magazine of ~64 objects per class, flushed to a global list in
- * batches, which removes the lock from the hot path entirely.  A spinlock rather than pthread_mutex_t because mutex
- * initialisation and the pthread symbols are things we would rather not
- * touch this early in process startup.
+ * One global spinlock, guarding the class free lists and the arena.  Threads
+ * keep the lock off their hot path with the magazines below; what is left for
+ * it is batch refills, batch drains, new spans and large allocations.
+ *
+ * A spinlock rather than pthread_mutex_t because mutex initialisation and the
+ * pthread symbols are things we would rather not touch this early in process
+ * startup.
  */
 /* shortcut: no pthread_atfork handler, so a fork() that races a thread
  * holding this lock leaves the child with a lock nobody will ever release,
@@ -225,6 +226,182 @@ static unsigned cls_of(size_t size)
 }
 
 /*
+ * PER-THREAD MAGAZINES.
+ *
+ * The global lock was costing 16x glibc at four threads, all of it
+ * contention: every malloc and every free touched the same cache line.  A
+ * magazine is a per-thread, per-class free list that malloc pops and free
+ * pushes with no lock at all.  The lock is taken only to refill an empty
+ * magazine or drain a full one, in batches, so its cost is divided by the
+ * batch size -- 256 objects for the 16-byte class.
+ *
+ * TLS, CAREFULLY.  The re-entrancy note at the top of this file rules out
+ * __thread, because a dynamic-TLS access can call __tls_get_addr, which can
+ * reach dlopen bookkeeping, which allocates, which calls us.  The
+ * initial-exec model is the exception: the offset is resolved at load time
+ * and the access compiles to one %fs-relative load with no call and no lazy
+ * allocation.  It is only valid for an object present at program start,
+ * which is exactly how this one is loaded.  A dlopen'd slab would be
+ * rejected by the loader for want of static TLS surplus, which is a far
+ * louder failure than the recursion the model avoids.
+ *
+ * The slot holds a pointer rather than the magazines themselves.  Eight bytes
+ * of static TLS instead of five hundred, and -- the useful part -- the
+ * magazines outlive the thread that used them, which is what makes the
+ * adoption in tc_claim() possible.
+ *
+ * Only recycled objects are ever put in a magazine.  A never-used object
+ * comes straight off the bump pointer and is handed back directly, so calloc
+ * can still tell that it is untouched zero page and skip the memset.
+ */
+#define MAG_BYTES 8192u   /* per class, per thread, before a drain */
+
+struct mag {
+	void    *head;    /* threaded through the free objects, as the global list is */
+	uint32_t n;
+};
+
+struct tcache {
+	struct mag     m[NCLASS];
+	int            owner;   /* tid; the registry outlives the thread */
+	struct tcache *next;
+};
+
+static struct tcache *tc_all;              /* registry; written under lk */
+static char *tcpool, *tcpool_end;          /* bump space for tcache structs */
+static __thread struct tcache *tc __attribute__((tls_model("initial-exec")));
+
+/*
+ * Claim this thread's magazines: adopt a set whose owner has exited, or carve
+ * a new one.  Called with the lock held.  Returns NULL if memory ran out, and
+ * a NULL tc is a complete fallback -- every path below then behaves exactly
+ * as it did before magazines existed.
+ *
+ * Adoption is what keeps a thread-churning program from leaking.  A thread
+ * that exits runs no code of ours: pthread_key_create's destructor is the
+ * usual answer and is ruled out here, because pthread_setspecific allocates
+ * for key indices past the first level and would call straight back into us.
+ * So the magazines live in our own memory, the registry outlives every
+ * thread, and liveness is a tgkill(tid, 0).  A recycled tid makes that say
+ * "alive", which costs one unnecessary carve and is otherwise harmless.
+ */
+static struct tcache *tc_claim(void)
+{
+	int saved = errno;   /* a successful malloc must not disturb errno */
+	int me = (int)syscall(SYS_gettid);
+	int pid = (int)getpid();
+
+	for (struct tcache *t = tc_all; t; t = t->next) {
+		if (t->owner == me)
+			continue;
+		if (syscall(SYS_tgkill, pid, t->owner, 0) == 0 || errno != ESRCH)
+			continue;
+		t->owner = me;
+		errno = saved;
+		return t;
+	}
+
+	/* Carved from a dedicated mapping, not from our own malloc, which would
+	 * recurse straight back here, and not from the arena, whose cursor has
+	 * to stay span-aligned. */
+	if ((size_t)(tcpool_end - tcpool) < sizeof(struct tcache)) {
+		char *m = mmap(NULL, SPAN_SIZE, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED) {
+			errno = saved;
+			return NULL;
+		}
+		tcpool = m;
+		tcpool_end = m + SPAN_SIZE;
+	}
+	struct tcache *t = (struct tcache *)tcpool;
+	tcpool += round_up(sizeof *t, 64);   /* mmap gave it to us zeroed */
+	t->owner = me;
+	t->next = tc_all;
+	tc_all = t;
+	errno = saved;
+	return t;
+}
+
+/*
+ * Hand the whole magazine back to the global free list.  The walk is to find
+ * its tail, which splicing a list onto a singly-linked list requires.
+ *
+ * Keeping half of it back would be the textbook move, to stop a workload
+ * sitting exactly on the threshold from taking the lock every other
+ * operation.  That hysteresis is already here: a drain triggers at MAG_BYTES
+ * and a refill stops at MAG_BYTES/2, so the magazine has to be filled halfway
+ * again before it can drain again.  Keeping half was implemented, measured
+ * across all five benchmarks, and made no difference outside the run-to-run
+ * noise, so the midpoint walk it needed is not here.
+ */
+static void mag_drain(unsigned cls)
+{
+	struct mag *m = &tc->m[cls];
+	void *tail = m->head;
+
+	for (uint32_t i = 1; i < m->n; i++)
+		tail = *(void **)tail;
+	lock();
+	*(void **)tail = klass[cls].freelist;
+	klass[cls].freelist = m->head;
+	unlock();
+	m->head = NULL;
+	m->n = 0;
+}
+
+/*
+ * Take a batch off the class's global free list, return one object and keep
+ * the rest.  Called with the lock held; this is the acquisition the magazine
+ * exists to amortise.  An empty global list means there is nothing recycled
+ * to batch, so fall through to the bump pointer for a single fresh object.
+ */
+static void *mag_refill(unsigned cls, int *fresh)
+{
+	struct mag *m = &tc->m[cls];
+	uint32_t want = (MAG_BYTES / 2) / cls_size[cls];
+	void *first = klass[cls].freelist, *last;
+	uint32_t got = 1;
+
+	if (!first)
+		return alloc_small(cls, fresh);
+	if (!want)
+		want = 1;
+	last = first;
+	while (got < want && *(void **)last) {
+		last = *(void **)last;
+		got++;
+	}
+	klass[cls].freelist = *(void **)last;
+	*(void **)last = NULL;
+	m->head = *(void **)first;   /* NULL when got == 1, since last == first */
+	m->n = got - 1;
+	*fresh = 0;
+	return first;
+}
+
+/* The whole small path: magazine first, lock only when it is empty. */
+static void *small(unsigned cls, int *fresh)
+{
+	struct tcache *t = tc;
+	void *p;
+
+	if (t && t->m[cls].head) {
+		p = t->m[cls].head;
+		t->m[cls].head = *(void **)p;
+		t->m[cls].n--;
+		*fresh = 0;
+		return p;
+	}
+	lock();
+	if (!t)
+		t = tc = tc_claim();
+	p = t ? mag_refill(cls, fresh) : alloc_small(cls, fresh);
+	unlock();
+	return p;
+}
+
+/*
  * Large / over-aligned allocations: one mmap each, with a span header in
  * front so free() finds them by the same AND-mask as everything else.
  *
@@ -305,9 +482,7 @@ void *malloc(size_t size)
 		p = alloc_big(size, 16);
 		unlock();
 	} else {
-		lock();
-		p = alloc_small(cls_of(size), &fresh);
-		unlock();
+		p = small(cls_of(size), &fresh);
 	}
 	if (!p)
 		errno = ENOMEM;
@@ -318,6 +493,21 @@ void free(void *p)
 {
 	if (!p)                       /* free(NULL) is a no-op, per C11 7.22.3.3 */
 		return;
+	/* A span header is written before the span's first object is handed out
+	 * and never changes afterwards, so reading cls costs no lock -- and not
+	 * taking one here is the entire point of the magazines.  The slow path
+	 * below recomputes it, which is a handful of instructions in exchange
+	 * for leaving that path exactly as it was. */
+	struct hdr *hh = hdr_of(p);
+	if (hh && hh->cls != CLS_LARGE && tc) {
+		struct mag *m = &tc->m[hh->cls];
+		*(void **)p = m->head;
+		m->head = p;
+		m->n++;
+		if ((size_t)m->n * cls_size[hh->cls] > MAG_BYTES)
+			mag_drain(hh->cls);
+		return;
+	}
 	lock();
 	struct hdr *h = hdr_of(p);
 	if (!h) {
@@ -355,9 +545,7 @@ void *calloc(size_t n, size_t m)
 		return malloc(size);       /* fresh mmap: already zero */
 
 	int fresh;
-	lock();
-	p = alloc_small(cls_of(size), &fresh);
-	unlock();
+	p = small(cls_of(size), &fresh);
 	if (!p) { errno = ENOMEM; return NULL; }
 	/* A bump-allocated object has never been written, and spans are never
 	 * recycled across classes, so it is still the kernel's zero page. */

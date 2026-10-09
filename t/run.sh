@@ -142,28 +142,66 @@ else
 	head -4 "$T/g.out" | sed 's/^/        /'
 fi
 
+# rss_ratio LIB CMD...  -- peak RSS of CMD under LIB, over peak RSS without.
+#
+# wait4(), not getrusage(RUSAGE_CHILDREN).  That reports the maximum over
+# every child already reaped rather than the last one, so running glibc first
+# and the preload second and dividing yields max(a,b)/a: a number that can
+# never fall below 1.00, and which therefore reported exactly 1.00 for any
+# workload where slab was the better of the two.  It had teeth only in the
+# direction of slab being worse.  wait4 reports the rusage of one named child.
+rss_ratio() {
+	_lib=$1
+	shift
+	python3 - "$_lib" "$@" <<'PY'
+import os, sys
+lib, args = sys.argv[1], sys.argv[2:]
+def run(env):
+    e = dict(os.environ); e.update(env)
+    pid = os.fork()
+    if pid == 0:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        try:
+            os.execvpe(args[0], args, e)
+        finally:
+            os._exit(127)
+    _, st, ru = os.wait4(pid, 0)
+    if st:
+        sys.exit("child exited with status %d" % st)
+    return ru.ru_maxrss
+print("%.2f" % (run({"LD_PRELOAD": lib}) / run({})))
+PY
+}
+
 # Footprint.  slab never returns memory to the OS (see the shortcut note in
 # slab.c), so this is the ceiling made measurable rather than a pass we
 # expect to be tight.
-rss=$(python3 - "$SLAB" <<'PY'
-import os, resource, subprocess, sys
-prog = ["python3", "-c",
-        "d=[bytearray(i%4096) for i in range(60000)]\n"
-        "d=[x for i,x in enumerate(d) if i%3]\n"
-        "print(len(d))"]
-def run(env):
-    e = dict(os.environ); e.update(env)
-    subprocess.run(prog, env=e, stdout=subprocess.DEVNULL)
-    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-a = run({})
-b = run({"LD_PRELOAD": sys.argv[1]})
-print("%.2f" % (b / a))
+cat > "$T/churn.py" <<'PY'
+d = [bytearray(i % 4096) for i in range(60000)]
+d = [x for i, x in enumerate(d) if i % 3]
+print(len(d))
 PY
-)
+rss=$(rss_ratio "$SLAB" python3 "$T/churn.py")
 if python3 -c "import sys; sys.exit(0 if float('$rss') < 3.0 else 1)"; then
 	ok "peak RSS ${rss}x glibc on a churn workload (limit 3.0x)"
 else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
+fi
+
+# Thread churn.  Magazines belong to a thread, and a thread that exits runs
+# none of our code, so every object still on its magazines becomes
+# unreachable unless something reclaims them.  A thousand threads created and
+# joined one at a time, with nothing live when it ends, makes peak RSS a
+# direct measurement of what is retained per dead thread.
+unit "stress: 1000 sequential threads, nothing live at the end" \
+	./t/stress tchurn 1000
+tcr=$(rss_ratio "$SLAB" ./t/stress tchurn 1000)
+if python3 -c "import sys; sys.exit(0 if float('$tcr') < 1.5 else 1)"; then
+	ok "peak RSS ${tcr}x glibc after 1000 dead threads (limit 1.5x)"
+else
+	bad "peak RSS ${tcr}x glibc after 1000 dead threads - magazines leaking?"
 fi
 
 # ---------------------------------------------------------------- tier 3
@@ -206,6 +244,25 @@ mutant "a realloc that copies half the bytes" "check" \
 	's|\tmemcpy(q, p, old < size ? old : size);|\tmemcpy(q, p, (old < size ? old : size) / 2);|'
 mutant "a class index one too small for one octave" "check" \
 	's|>> (b - 2));|>> (b - 2)) - (b == 5);|'
+
+# The two RSS limits are measurements rather than exit statuses, so `mutant`
+# cannot drive them: an allocator that leaks a megabyte per dead thread still
+# exits 0.  Build the no-adoption slab by hand and require the thread-churn
+# limit to throw it out.
+sed 's|if (syscall(SYS_tgkill, pid, t->owner, 0) == 0 |if (1 |' slab.c >"$T/na.c"
+if cmp -s "$T/na.c" slab.c; then
+	bad "self-check no-adoption: sed did not apply (slab.c changed shape)"
+elif ! gcc $MUT -o "$T/na.so" "$T/na.c" 2>"$T/m.err"; then
+	bad "self-check no-adoption: mutant did not compile"
+	head -2 "$T/m.err" | sed 's/^/        /'
+else
+	nar=$(rss_ratio "$T/na.so" ./t/stress tchurn 1000)
+	if python3 -c "import sys; sys.exit(0 if float('$nar') >= 1.5 else 1)"; then
+		ok "self-check: thread-churn RSS rejects magazines with no adoption (${nar}x)"
+	else
+		bad "self-check: no-adoption magazines measured only ${nar}x, limit has no teeth"
+	fi
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

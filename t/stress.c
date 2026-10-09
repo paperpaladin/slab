@@ -11,6 +11,12 @@
  * threads through a shared pool so cross-thread free() is exercised against
  * the global free lists.
  *
+ * Mode `tchurn`: create and join N threads one at a time, each allocating a
+ * working set across many size classes and freeing all of it.  Nothing is
+ * live when it ends, so peak RSS measures exactly what the allocator keeps
+ * back per dead thread -- which is what a per-thread cache gets wrong when
+ * the cache dies with its thread and the objects on it become unreachable.
+ *
  * Mode `bench`: timing, printed as "name ns/op".  Five phases chosen to
  * separate where slab is competitive from where it is not.
  *
@@ -576,6 +582,31 @@ static void bench_threads(long iters, int nthreads)
 	report("4-thread-churn", now() - t0, iters * nthreads);
 }
 
+/* ---------------- thread-churn mode ---------------- */
+
+/*
+ * Touch a wide spread of size classes and free every byte of it.  Spread,
+ * because a per-thread cache is per class: a worker that used one class
+ * would leave only one magazine behind and hide the cost of the other 31.
+ */
+static void *tchurn_worker(void *arg)
+{
+	enum { NB = 400 };
+	static __thread void *v[NB];
+	(void)arg;
+
+	for (int round = 0; round < 3; round++) {
+		for (int i = 0; i < NB; i++) {
+			v[i] = malloc(16 + (size_t)((i * 37) % 8100));
+			if (v[i])
+				memset(v[i], 0xa5, 16);
+		}
+		for (int i = 0; i < NB; i++)
+			free(v[i]);
+	}
+	return NULL;
+}
+
 /* ---------------- main ---------------- */
 
 int main(int argc, char **argv)
@@ -609,6 +640,17 @@ int main(int argc, char **argv)
 				}
 				free(shared[i].p);
 			}
+	} else if (!strcmp(mode, "tchurn")) {
+		long threads = n ? n : 300;
+		for (long i = 0; i < threads; i++) {
+			pthread_t t;
+			if (pthread_create(&t, NULL, tchurn_worker, NULL) != 0) {
+				printf("  FAIL pthread_create at %ld\n", i);
+				failures++;
+				break;
+			}
+			pthread_join(t, NULL);
+		}
 	} else if (!strcmp(mode, "bench")) {
 		long it = n ? n : 2000000;
 		bench_small(it);
@@ -618,7 +660,8 @@ int main(int argc, char **argv)
 		bench_threads(it / 4, 4);
 		return 0;
 	} else {
-		fprintf(stderr, "usage: stress check|stress|thread|bench [iters]\n");
+		fprintf(stderr,
+			"usage: stress check|stress|thread|tchurn|bench [n]\n");
 		return 2;
 	}
 
