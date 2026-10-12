@@ -80,7 +80,7 @@ Ranked by how much it would embarrass us to fail it.
 6. **The oracle checked against glibc.** The same stress and semantic tests
    run against glibc `malloc`. If they fail there, the test is wrong, not
    slab.
-7. **Mutation self-check.** `make test` builds four deliberately broken
+7. **Mutation self-check.** `make test` builds five deliberately broken
    slabs -- overlapping objects, a `calloc` that never zeroes, a `realloc`
    that copies half the bytes, a class index one too small for one octave --
    and requires each to be rejected *by the check that owns that behaviour*,
