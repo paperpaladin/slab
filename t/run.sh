@@ -25,6 +25,7 @@ trap 'rm -rf "$T"' EXIT
 
 pass=0
 fail=0
+skipped=0
 ok()  { pass=$((pass + 1)); printf 'ok    %s\n' "$*"; }
 bad() { fail=$((fail + 1)); printf 'FAIL  %s\n' "$*"; }
 
@@ -106,7 +107,18 @@ same() {
 		grep '^slab:' "$T/b.err" | head -2 | sed 's/^/        /'
 		return
 	fi
-	ok "$name ($(wc -c <"$T/a.out") bytes identical)"
+	# Two identical failures compare equal. A command that does not exist
+	# produces empty stdout on both sides, matching stderr, and no `slab:`
+	# diagnostic -- so it reached "ok <name> (0 bytes identical)". Every
+	# line in this family produces output today (the smallest is 5 bytes),
+	# so nothing is currently vacuous; a renamed python3 or gcc would have
+	# turned four of the heaviest checks into passes.
+	_nb=$(wc -c <"$T/a.out")
+	if [ "$_nb" -eq 0 ] && [ ! -s "$T/a.err" ]; then
+		bad "$name: produced no output at all, so there was nothing to compare"
+		return
+	fi
+	ok "$name ($_nb bytes identical)"
 }
 
 same "ls -la /usr/bin"        "ls -la /usr/bin"
@@ -252,7 +264,21 @@ if command -v strace >/dev/null 2>&1; then
 		ours=$(mu "$SLAB"); ours=${ours:-0}
 		theirs=$(LD_PRELOAD= strace -c -e trace=munmap "$T/bigloop" 200 2>&1 \
 		         >/dev/null | awk '$NF=="munmap"{print $4}'); theirs=${theirs:-0}
-		if [ "$theirs" -gt 20 ]; then
+		# Is the workload in the large path at all? The `theirs -gt 20`
+		# guard below cannot answer that: glibc caches large frees too,
+		# so a size that never reaches slab's large path gives
+		# ours=1 theirs=1 and reads as a working cache. Changing
+		# bigloop's malloc(300000) to malloc(300) produced exactly
+		# that -- "ok span cache: 200 large cycles cost 1 munmaps
+		# (glibc 1)". The size is reported by the program and checked
+		# against slab's MAXSMALL here.
+		bigsz=$("$T/bigloop" 1 size)
+		maxsmall=$(sed -n 's/^#define MAXSMALL *\([0-9]*\)u.*/\1/p' slab.c)
+		if [ -z "$bigsz" ] || [ -z "$maxsmall" ]; then
+			bad "span cache: could not read the workload size or MAXSMALL"
+		elif [ "$bigsz" -le "$maxsmall" ]; then
+			bad "span cache: bigloop allocates $bigsz, at or under MAXSMALL ($maxsmall), so it never reaches the large path"
+		elif [ "$theirs" -gt 20 ]; then
 			bad "span cache: glibc made $theirs munmaps, so the workload is wrong"
 		elif [ "$ours" -le 20 ]; then
 			ok "span cache: 200 large cycles cost $ours munmaps (glibc $theirs)"
@@ -261,6 +287,11 @@ if command -v strace >/dev/null 2>&1; then
 		fi
 	fi
 else
+	# Counted, not just printed: this is the one skippable check and the
+	# suite has no skip counter, so "31 passed, 0 failed" with strace
+	# missing was indistinguishable from a 31-check suite that ran
+	# everything. prof does this correctly; slab did not.
+	skipped=$((skipped + 1))
 	printf 'SKIP span cache munmap count (strace not installed)\n'
 fi
 
@@ -324,5 +355,5 @@ else
 	fi
 fi
 
-printf '\n%d passed, %d failed\n' "$pass" "$fail"
+printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
