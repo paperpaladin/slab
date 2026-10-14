@@ -95,8 +95,7 @@ Ranked by how much it would embarrass us to fail it.
    not merely by some check somewhere. A suite that cannot fail is not a
    suite, and this is not hypothetical: it is how we found that gcc was
    deleting the `calloc` zero-check as a provable tautology, and the
-   ownership requirement is what made it visible, not masked by the
-   fuzzer catching it incidentally.
+   ownership requirement is what made it visible instead of masked by the fuzzer catching it incidentally.
 8. Footprint. Peak RSS under the preload compared against glibc on a
    churn workload, bounded at 3x. Makes the "never returns memory to the OS"
    shortcut a measured number, not a footnote.
