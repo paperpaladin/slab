@@ -18,7 +18,7 @@ So this is a real allocator: `mmap`, size classes, free lists, direct `mmap`
 for large blocks, written small enough that the interesting part is the
 oracle, not the code.
 
-It is also an answer to a narrower question: how much does a per-object
+It is also an answer to a narrower question. How much does a per-object
 header cost? glibc puts 8 to 16 bytes of chunk metadata in front of every
 allocation. slab puts 64 bytes at the base of each 64 KiB span instead and
 finds it with one `AND`, which is 0.1% overhead instead of 100% on a 16-byte
