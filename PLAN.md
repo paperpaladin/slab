@@ -7,7 +7,7 @@
 `posix_memalign`, `aligned_alloc`, `memalign`, `valloc`, `pvalloc`,
 `reallocarray` and `malloc_usable_size`.
 
-It gets memory from `mmap(2)` and nothing else -- never from `brk`, never
+It gets memory from `mmap(2)` and nothing else, never from `brk`, never
 from the real `malloc`. Small requests (<= 8192 bytes) are rounded to one of
 32 size classes and served from per-class free lists carved out of 64 KiB
 spans; anything larger gets its own `mmap`.
@@ -39,10 +39,10 @@ every test in the oracle exists to attack one of them:
   a span serves exactly one class for its whole life, and because a pointer
   on a free list is not reachable from anywhere else.
 - Alignment holds because spans are 64 KiB-aligned, payloads start at
-  offset 64, and every class size is a multiple of 16 -- so every object
+  offset 64, and every class size is a multiple of 16, so every object
   offset within a span is a multiple of 16. The `_Static_assert`s on
   `HDR % 16` and `sizeof(struct hdr) <= HDR` are the part a compiler can
-  check; the class table being all multiples of 16 is checked by the oracle.
+  check. The class table being all multiples of 16 is checked by the oracle.
 
 Over-aligned requests leave the size classes entirely and get a dedicated
 mapping, so they cannot weaken either half.
@@ -51,36 +51,36 @@ mapping, so they cannot weaken either half.
 
 Ranked by how much it would embarrass us to fail it.
 
-1. **Real programs, byte-identical output.** `ls`, `cat`, `grep`, `sort`,
+1. Real programs, byte-identical output. `ls`, `cat`, `grep`, `sort`,
    `wc`, `sh` pipelines, `python3` doing JSON and dict and string-building
-   work, and `gcc` compiling a C file -- each run twice, once normally and
+   work, and `gcc` compiling a C file, each run twice, once normally and
    once under the preload, demanding identical stdout, identical stderr and
    identical exit status. Nothing we could write is as good an allocator
    test as `sort` on a 3 MB file or CPython under a JSON round-trip.
-2. **The byte-pattern stress test.** Millions of random
+2. The byte-pattern stress test. Millions of random
    `malloc`/`calloc`/`posix_memalign`/`realloc`/`free` over 2048 live slots,
    with each block filled with a pattern derived from a unique tag and
    verified on every subsequent touch. This is the only thing that reliably
    catches overlapping allocations, which is the bug that matters most
    because it corrupts silently and far from its cause.
-3. **The direct no-overlap test.** Hold 30 000 live blocks of every
+3. The direct no-overlap test. Hold 30 000 live blocks of every
    interesting size at once, sort them by address, assert no block's payload
    reaches into the next one's. Attacks the hard invariant head-on instead
    of waiting for a pattern mismatch.
-4. **Cross-thread stress.** Four threads churning, handing blocks to each
+4. Cross-thread stress. Four threads churning, handing blocks to each
    other through a shared pool so blocks are freed on a thread other than
    the one that allocated them.
-5. **Semantic conformance.** Alignment of every size from 0 to 4096 plus
+5. Semantic conformance. Alignment of every size from 0 to 4096 plus
    large and over-aligned cases; `posix_memalign` from 8 bytes to 4 MiB of
    alignment including the `EINVAL` cases; `calloc` zeroing *after
    dirtying and freeing the same block*, which is what catches an allocator
    that only zeroes fresh pages; `realloc` content preservation across every
    class boundary in both directions; `free(NULL)`; `malloc(0)`;
    out-of-range sizes returning `NULL`.
-6. **The oracle checked against glibc.** The same stress and semantic tests
+6. The oracle checked against glibc. The same stress and semantic tests
    run against glibc `malloc`. If they fail there, the test is wrong, not
    slab.
-6b. **LD_PRELOAD interposition, checked first.** `malloc_usable_size(malloc(1))`
+6b. LD_PRELOAD interposition, checked first. `malloc_usable_size(malloc(1))`
    is compared with and without the preload, before any allocator behaviour is
    asserted. Without it the entire suite was green against a library that
    defines no `malloc`: a `libslab.so` built from one unused variable passes
@@ -88,24 +88,24 @@ Ranked by how much it would embarrass us to fail it.
    and all five mutants. This was missing from the Oracle list entirely, and
    it is the one check everything else depends on.
 
-7. **Mutation self-check.** `make test` builds five deliberately broken
-   slabs -- overlapping objects, a `calloc` that never zeroes, a `realloc`
+7. Mutation self-check. `make test` builds five deliberately broken
+   slabs, overlapping objects, a `calloc` that never zeroes, a `realloc`
    that copies half the bytes, a class index one too small for one octave,
-   and magazines with no adoption (this list named four of the five) --
+   and magazines with no adoption (this list named four of the five),
    and requires each to be rejected *by the check that owns that behaviour*,
    not merely by some check somewhere. A suite that cannot fail is not a
    suite, and this is not hypothetical: it is how we found that gcc was
    deleting the `calloc` zero-check as a provable tautology, and the
-   ownership requirement is what made it visible rather than masked by the
+   ownership requirement is what made it visible, not masked by the
    fuzzer catching it incidentally.
-8. **Footprint.** Peak RSS under the preload compared against glibc on a
+8. Footprint. Peak RSS under the preload compared against glibc on a
    churn workload, bounded at 3x. Makes the "never returns memory to the OS"
-   shortcut a measured number rather than a footnote.
+   shortcut a measured number, not a footnote.
 
 ## Non-goals
 
 - Beating glibc. glibc's `malloc` has per-thread tcaches, per-thread arenas
-  and twenty years of tuning; a 300-line allocator with one global lock will
+  and twenty years of tuning. A 300-line allocator with one global lock will
   lose, and the README says where.
 - Hardening. No guard pages, no free-list pointer mangling, no double-free
   detection, no canaries. A double free corrupts the free list silently.
@@ -143,7 +143,7 @@ Ranked by how much it would embarrass us to fail it.
         recorded before anything is tested, not after.
 - [x] t/stress.c: semantic conformance, and the hard invariant tested directly
       - why: the contract checks output comparison can never see, plus a
-        head-on test of the no-overlap invariant rather than waiting for a
+        head-on test of the no-overlap invariant instead of waiting for a
         symptom.
 - [x] t/run.sh: real programs under LD_PRELOAD, and `make test`
       - why: the only tier that really matters.  ls, cat, grep, sort, wc, a
@@ -157,8 +157,8 @@ Ranked by how much it would embarrass us to fail it.
         cross-thread free is the case a per-thread cache would get wrong.
 - [x] t/run.sh: run the oracle against glibc, and measure the footprint
       - why: guards against the suite drifting into a description of slab;
-        and turns "peak RSS is sticky" from an assertion into a measurement
-        -- 1.10x on the churn workload, measured twice.
+        and turns "peak RSS is sticky" from an assertion into a measurement:
+        1.10x on the churn workload, measured twice.
 - [x] t/run.sh: mutation self-check - RED, it indicts the oracle
       - why: `make test` fails at this commit on purpose.  A slab whose
         calloc never zeroes passes the targeted calloc check, because gcc
@@ -178,7 +178,7 @@ Ranked by how much it would embarrass us to fail it.
       - why: the ranked backlog is derived from the benchmark, so it comes
         after it.
 
-### Milestone 1 -- the things the benchmarks say to fix, in order of payoff
+### Milestone 1: the things the benchmarks say to fix, in order of payoff
 
 - [x] Per-thread magazines: a small per-class cache of objects owned by one
       thread, refilled and flushed in batches under the global lock.
@@ -190,7 +190,7 @@ Ranked by how much it would embarrass us to fail it.
         initial-exec, which is the only model that cannot reach malloc
         through __tls_get_addr. The magazines live in our own memory with a
         registry that outlives every thread, and a dead thread's set is
-        adopted by the next thread to ask, tested with tgkill(tid, 0) --
+        adopted by the next thread to ask, tested with tgkill(tid, 0),
         pthread_key_create's destructor is the usual answer and is ruled out
         because pthread_setspecific allocates. New thread-churn test: 1000
         threads created and joined one at a time, peak RSS 1.00x glibc, and
@@ -209,7 +209,7 @@ Ranked by how much it would embarrass us to fail it.
         best-fit within 25%, not exact: exact matching is the obvious design
         and moved large-churn by 2%, because that benchmark picks random sizes
         and page-rounding still leaves ~250 distinct lengths for a 16-entry
-        cache to miss. Bounded on bytes (64 MiB) rather than entries, and the
+        cache to miss. Bounded on bytes (64 MiB), not entries, and the
         waste shows up as 1.10x glibc peak RSS against a 3.0x limit.
       - the correctness half: a recycled mapping is dirty, and calloc was
         `return malloc(size)` for anything over 8 KiB with the comment "fresh
@@ -237,7 +237,7 @@ Ranked by how much it would embarrass us to fail it.
 - [ ] A fragmentation visualiser: dump span occupancy to a file descriptor
       on a signal, render it as a PNG or an HTML heat map offline.
       - why: internal fragmentation is currently an argument from the class
-        spacing rather than a measurement of a real workload.
+        spacing, not a measurement of a real workload.
 - [ ] Trace-replay benchmarking: record every allocator call from a real
       program to a ring buffer, replay the trace against slab and glibc.
       - why: the synthetic benchmark is our guess at a realistic pattern.
@@ -246,7 +246,7 @@ Ranked by how much it would embarrass us to fail it.
       helps or hurts.
       - why: 4 MiB arenas are exactly the shape THP wants; worth knowing
         whether the TLB win beats the zeroing cost.
-- [ ] Return a dead thread's magazines eagerly rather than on adoption.
+- [ ] Return a dead thread's magazines eagerly, not on adoption.
       - why: adoption bounds the stranded memory by peak thread count, not by
         threads created, which is enough for a thread pool and not for a
         program that peaks at 500 threads and then runs one. The honest
@@ -265,5 +265,5 @@ Ranked by how much it would embarrass us to fail it.
 - [ ] Optional free-list pointer mangling and a cheap double-free check,
       behind a compile-time flag.
       - why: a double free currently corrupts the free list into a cycle
-        and the next `malloc` returns a live block -- the exact silent
+        and the next `malloc` returns a live block: the exact silent
         corruption the hard invariant is supposed to rule out.

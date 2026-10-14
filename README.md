@@ -14,9 +14,9 @@ Because "my allocator passes my tests" is worth nothing, and "`gcc` compiles
 a file correctly with my allocator loaded instead of glibc's" is worth
 something. An allocator is one of the few pieces of software with a
 ready-made, adversarial, enormous test corpus: every program on the machine.
-So this is a real allocator -- `mmap`, size classes, free lists, direct `mmap`
-for large blocks -- written small enough that the interesting part is the
-oracle rather than the code.
+So this is a real allocator: `mmap`, size classes, free lists, direct `mmap`
+for large blocks, written small enough that the interesting part is the
+oracle, not the code.
 
 It is also an answer to a narrower question: how much does a per-object
 header cost? glibc puts 8 to 16 bytes of chunk metadata in front of every
@@ -28,8 +28,8 @@ object. That is the footprint benchmark slab wins, and it wins it by 39%.
 
 `make test` runs 32 checks in three tiers.
 
-**Tier 1, which is the whole point:** real system binaries, run twice -- once
-normally, once with `LD_PRELOAD=./libslab.so` -- demanding that stdout,
+Tier 1, which is the whole point: real system binaries, run twice, once
+normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
 stderr and the exit status are *byte-identical*. `ls -la /usr/bin`,
 `ls -R /usr/include`, `cat` and `sort` and `wc` on a 3.4 MB generated file,
 `grep -r` across `/usr/include`, a `cut | sort | uniq -c | sort -rn` shell
@@ -38,25 +38,25 @@ pipeline, `python3` doing a 40 000-object JSON round trip, a 300 000-key
 compiling the test program itself. Any diagnostic from slab on stderr also
 fails the check, so a path we do not handle cannot pass quietly.
 
-**Tier 2:** the things output comparison cannot see -- alignment of every size
+Tier 2: the things output comparison cannot see: alignment of every size
 from 0 to 4096, `posix_memalign` from 8 bytes to 4 MiB of alignment,
 `calloc` zeroing *verified after dirtying and freeing the same block*,
 `realloc` content preservation across every class boundary in both
 directions, `free(NULL)`, `malloc(0)`, and a byte-pattern stress test: 3
 million random operations over 2048 live slots, each block filled with a
 pattern derived from a unique tag and verified on every touch. Plus a direct
-assault on the hard invariant -- 30 000 simultaneous live blocks, sorted by
-address, asserting that none overlaps the next -- and the same stress on four
+assault on the hard invariant: 30 000 simultaneous live blocks, sorted by
+address, asserting that none overlaps the next, and the same stress on four
 threads with blocks handed between them so cross-thread `free` is exercised.
 The stress and semantic tests also run against glibc `malloc`, because if
 they fail there then the test is wrong, not slab.
 
-**Tier 3:** the oracle checked for teeth, by mutation. `make test` builds five
-deliberately broken slabs -- objects that overlap by 8 bytes, a `calloc` that
+Tier 3: the oracle checked for teeth, by mutation. `make test` builds five
+deliberately broken slabs, objects that overlap by 8 bytes, a `calloc` that
 never zeroes, a `realloc` that copies half the bytes, a class index one too
-small for one octave, and magazines with no adoption -- and requires each to
+small for one octave, and magazines with no adoption, and requires each to
 be rejected *by the check that owns that behaviour*, not merely by some check
-somewhere. (This said four and named four; the same README says "Five are
+somewhere. (This said four and named four. The same README says "Five are
 permanent fixtures" further down.) That distinction is
 load-bearing; see below.
 
@@ -96,9 +96,9 @@ ok    self-check: 'stress check' rejects a class index one too small for one oct
 ok    self-check: thread-churn RSS rejects magazines with no adoption (10.42x)
 ```
 
-`malloc_usable_size` is the cheapest observable that separates them --
-slab's header is 16 bytes for a 1-byte request where this glibc's is 24 --
-and the two values are **compared rather than pinned**, so the check
+`malloc_usable_size` is the cheapest observable that separates them,
+slab's header is 16 bytes for a 1-byte request where this glibc's is 24,
+and the two values are **compared, not pinned**, so the check
 survives a libc whose own answer differs. With the empty library in place it
 now reads:
 
