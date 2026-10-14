@@ -28,7 +28,7 @@ object. That is the footprint benchmark slab wins, and it wins it by 39%.
 
 `make test` runs 32 checks in three tiers.
 
-Tier 1, which is the whole point: real system binaries, run twice, once
+Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
 stderr and the exit status are *byte-identical*. `ls -la /usr/bin`,
 `ls -R /usr/include`, `cat` and `sort` and `wc` on a 3.4 MB generated file,
