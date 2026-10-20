@@ -386,10 +386,42 @@ Ranked by how much it would embarrass us to fail it.
         did find a bug in the oracle: the "percentage given back" line
         underflowed to 18446744073709551608% when RSS ended above the peak
         reading, which is what ASan's own quarantine makes happen.
-- [ ] Reserve one span-aligned address-space region up front and carve
-      large mappings from it with `MAP_FIXED`.
-      - why: removes the two trimming `munmap` calls that `map_aligned`
-        pays on every large allocation and every new arena.
+- [x] Stop unmapping the alignment slack at the end of a large mapping
+      - why: this started as the item now at the bottom of this list,
+        "reserve one span-aligned region and carve it with MAP_FIXED", whose
+        stated payoff was the two trimming munmaps that map_aligned pays per
+        large allocation. The payoff was measured before the work, by
+        building a map_aligned with both trims simply deleted -- which leaks
+        address space and is not shippable, but is an upper bound:
+        large-churn 0.81x, mixed-sizes 0.94x, the other four flat. Worth
+        having.
+      - done, by taking the cheaper half. map_aligned over-maps by one span
+        and trims both ends; the BACK trim can be skipped outright for a
+        caller that can use address space at the end of its mapping, which
+        is exactly what a large block's PROT_NONE reservation is. Eleven
+        lines. Measured against the previous commit, eleven repetitions
+        interleaved: large-churn 0.85x, which is 3.71x glibc down from
+        4.72x; mixed-sizes 0.97x; realloc-grow 0.96x; the other three 0.98x
+        to 1.00x. Syscalls over a benchmark run: munmap 5108 -> 3479, mmap
+        and mprotect unchanged.
+      - what it is NOT: the front trim is still there and fires on all but
+        one call in sixteen (13 span-aligned returns in 200 probes). The
+        upper-bound build says removing that one too is worth another 0.02x
+        on large-churn and nothing elsewhere, which is why the MAP_FIXED
+        item has moved to the bottom of this list with that number attached.
+      - the arena path and the sub-RESERVE_MIN large path keep both trims on
+        purpose. An arena cannot use a remainder smaller than a span, and
+        the unreserved large path maps read-write, where folding slack in
+        would leave bytes past the end of the block writable. The last
+        assertion in `stress guard` is exactly that, and it fails if this is
+        got wrong.
+      - no new check, said plainly. The correctness of the fold is covered
+        by `guard` (the tail still faults), by the no-overlap test and by
+        tier 1; the gain is a timing and this suite asserts none. The
+        mutation harness did earn its keep: the expression for "a reserved
+        tail mapped writable" stopped matching when map_aligned grew an
+        argument, and the did-sed-apply guard turned the suite red instead
+        of printing a pass.
 - [ ] A fragmentation visualiser: dump span occupancy to a file descriptor
       on a signal, render it as a PNG or an HTML heat map offline.
       - why: internal fragmentation is currently an argument from the class
@@ -423,3 +455,15 @@ Ranked by how much it would embarrass us to fail it.
       - why: a double free currently corrupts the free list into a cycle
         and the next `malloc` returns a live block: the exact silent
         corruption the hard invariant is supposed to rule out.
+- [ ] Reserve one span-aligned address-space region up front and carve
+      large mappings from it with `MAP_FIXED`.
+      - why: removes the front trimming `munmap` that `map_aligned` still
+        pays on fifteen out of sixteen large allocations and new arenas.
+      - MOVED HERE FROM THIRD IN THIS MILESTONE, with a measurement. It was
+        ranked on removing both trims. The back one is gone, and an
+        upper-bound build with the front one deleted as well says the rest
+        is worth 0.02x on large-churn and nothing on the other five rows.
+        Doing it properly needs an address-space allocator: a free list of
+        span-aligned ranges with coalescing, or a bitmap over a fixed set of
+        reserved regions. That is around 120 lines and a new way for two
+        large allocations to overlap, which is a bad trade at 2%.
