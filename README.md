@@ -34,7 +34,7 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 66 checks in three tiers, plus a recorded corpus.
+`make test` runs 71 checks in three tiers, plus a recorded corpus.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -86,7 +86,7 @@ against glibc, with the replay required to reproduce the trace exactly
 before any timing from it is believed.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
-twenty-two deliberately broken slabs: objects that overlap by 8 bytes, a
+twenty-five deliberately broken slabs: objects that overlap by 8 bytes, a
 `calloc` that never zeroes, a `realloc` that copies half the bytes, a class
 index one too small for one octave, magazines with no adoption, a `realloc`
 that moves a large block instead of growing it, a reserved tail mapped
@@ -99,8 +99,10 @@ it is still empty, a span that is never relinked when it stops being full, a
 size class widened until one octave wastes a third, a `malloc_stats` that
 does not subtract the magazines, arenas that are never recorded so the dump
 sees no spans, arenas that never ask for huge pages, arenas aligned to a
-span instead of a huge page, magazines reclaimed only on adoption, and a
-sweep that drops a dead thread's magazines instead of returning them. Each must be rejected *by the check that owns that
+span instead of a huge page, magazines reclaimed only on adoption, a
+sweep that drops a dead thread's magazines instead of returning them, no
+`pthread_atfork` handlers at all, a prepare handler that does not take the
+lock, and a child that does not re-stamp its magazine set. Each must be rejected *by the check that owns that
 behaviour*, not merely by some check somewhere. That distinction is
 load-bearing; see below.
 
@@ -148,22 +150,24 @@ ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
 ok    peak RSS 1.12x glibc on a churn workload (limit 3.0x)
-ok    magazine sweep: 64 dead threads held 11084 KiB on their magazines, 7 KiB left after the next arena was wanted
+ok    fork: a multithreaded process forks and the child allocates
+ok    fork: glibc malloc survives it too, so the oracle is right
+ok    magazine sweep: 64 dead threads held 11092 KiB on their magazines, 7 KiB left after the next arena was wanted
 ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
 ok    fragmentation: glibc fails 9 of the per-size bounds, so they are slab's own
-ok    span reclaim: RSS 32936 -> 266472 -> 46932 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
+ok    span reclaim: RSS 33072 -> 265504 -> 45964 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
 ok    peak RSS 0.67x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
 ok    span cache: 200 large cycles cost 1 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
-ok    trace gcc: 720660 replayable ops, 10251 slots (peak live blocks), 368303 KiB requested
-ok    replay gcc under slab: 2161980 ops in 0.077s = 35.7 ns/op (3 reps, 10251 slots) vs glibc 22.8 ns/op (3 reps, 10251 slots)
+ok    trace gcc: 809925 replayable ops, 10820 slots (peak live blocks), 391071 KiB requested
+ok    replay gcc under slab: 2429775 ops in 0.083s = 34.2 ns/op (3 reps, 10820 slots) vs glibc 29.7 ns/op (3 reps, 10820 slots)
 ok    replay gcc under glibc reproduces it too, so the trace is sound
 ok    trace py: 20083 replayable ops, 6305 slots (peak live blocks), 97208 KiB requested
-ok    replay py under slab: 60249 ops in 0.008s = 131.0 ns/op (3 reps, 6305 slots) vs glibc 230.7 ns/op (3 reps, 6305 slots)
+ok    replay py under slab: 60249 ops in 0.012s = 195.0 ns/op (3 reps, 6305 slots) vs glibc 281.4 ns/op (3 reps, 6305 slots)
 ok    replay py under glibc reproduces it too, so the trace is sound
 ok    self-check: the replay rejects itself when it skips one op in sixteen
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
@@ -178,6 +182,9 @@ ok    self-check: 'stress guard' rejects a shrink that drops the pages but leave
 ok    self-check: 'stress reclaim 200' rejects a wholly free span that is never given back
 ok    self-check: 'stress reclaim 200' rejects a reclaim that re-arms the span without the madvise
 ok    self-check: 'stress reclaim 200' rejects a reclaim that leaves the span's first page dirty
+ok    self-check: 'stress fork 20' rejects no pthread_atfork handlers at all
+ok    self-check: 'stress fork 50' rejects a prepare handler that does not take the lock
+ok    self-check: 'stress fork 20' rejects a child that does not re-stamp its magazine set
 ok    self-check: 'stress sweep' rejects magazines reclaimed only on adoption
 ok    self-check: 'stress sweep' rejects a sweep that drops the magazines instead of returning them
 ok    self-check: 'stress huge' rejects arenas that never ask for huge pages
@@ -186,10 +193,10 @@ ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of
 ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
 ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (11.00x, limit 1.5x)
-ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.83x, limit 1.2x)
+ok    self-check: peak RSS rejects magazines with no adoption (11.22x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.74x, limit 1.2x)
 
-66 passed, 0 failed, 0 skipped
+71 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -462,6 +469,38 @@ The recorded program touched its memory in some pattern the trace does not
 carry, so page-fault and cache behaviour here is the replay's, not the
 program's. What carries over exactly is the sequence of sizes and the
 lifetimes.
+
+## fork() without exec(), from a thread
+
+A multithreaded program that forks and then allocates in the child used to
+hang: the child inherits the lock in whatever state it was in, and if
+another thread held it at that instant nothing in the child will ever
+release it. Not a corner case -- **120 of 200 forks** of a four-thread
+process produced a child that could not allocate. glibc's malloc handles
+this, so a drop-in replacement that does not is broken, whatever POSIX says
+about calling malloc in a forked child.
+
+Three `pthread_atfork` handlers. The **prepare** handler takes the lock, and
+that is what makes this correct rather than merely unstuck: resetting the
+lock in the child alone leaves whatever the holder was half-way through -- a
+free list part-spliced, a span's live count part-updated -- visible there.
+The mutant with prepare emptied out does not hang, it segfaults, in eight
+runs of eight.
+
+The **child** handler also re-stamps the thread's magazine set with its new
+tid. Every set the child inherited names a tid from the parent, and a thread
+created in the child calls the adoption path, finds a set whose owner is
+gone, and takes the one its parent thread is still using -- two threads
+pushing and popping the same magazines with no lock between them. That
+mutant survived two versions of the check before the child was made to
+create more threads than the parent had.
+
+The one cost is a constructor, and the claim at the top of `slab.c` that
+there is no initialisation step has been narrowed rather than deleted: it
+registers three handlers and initialises no table, so there is still no "am
+I initialised yet" flag to race on and an allocation before it runs is
+served exactly as one after. What is missing in that window is fork safety,
+and in that window the process has one thread.
 
 ## What a dead thread leaves behind
 

@@ -249,6 +249,28 @@ else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
 fi
 
+# fork() without exec(), from a multithreaded process. The failure mode is a
+# HANG -- the child inherits a lock held by a thread that does not exist
+# there -- so the child arms an alarm and the parent counts a child that died
+# of a signal as the failure. Before the pthread_atfork handlers existed this
+# measured 120 of 200 children. The child also creates NT+2 threads of its
+# own and churns with a verified byte pattern, which reaches the second
+# hazard: every magazine set the child inherited is stamped with a tid from
+# the parent, so a thread created here can adopt the set its parent thread is
+# still using.
+#
+# glibc passes it, and the suite requires that too: this is a drop-in
+# replacement, and a hang where the thing it replaces does not hang is a
+# defect rather than a difference of opinion about POSIX.
+unit "fork: a multithreaded process forks and the child allocates" \
+	./t/stress fork 50
+if ./t/stress fork 50 >"$T/fk.out" 2>&1; then
+	ok "fork: glibc malloc survives it too, so the oracle is right"
+else
+	bad "fork: glibc malloc fails this, so the test is wrong, not slab"
+	grep '^  FAIL' "$T/fk.out" | head -2 | sed 's/^/        /'
+fi
+
 # A dead thread's magazines. Adoption bounds what they strand by the PEAK
 # thread count rather than by the number of threads created, which is enough
 # for a pool and not for a program that peaks at many threads and then runs
@@ -634,6 +656,19 @@ mutant "a reclaim that leaves the span's first page dirty" "reclaim 200" \
 # candidate here, deleting the live++ in alloc_small, is left out: `frag`
 # catches it, but so does `reclaim`, and the reclaim mutants already own that
 # counter.
+# fork(). The second of these is the one that says the PREPARE handler earns
+# its place: simply resetting the lock in the child unsticks it and leaves
+# the child looking at a free list some parent thread was half-way through
+# splicing, which segfaults rather than hangs. It gets 50 forks where the
+# other two get 20, because at 20 it survived one run in five: a corruption
+# that has to be stepped on is less certain than a lock nobody will release.
+mutant "no pthread_atfork handlers at all" "fork 20" \
+	's|\tpthread_atfork(atfork_prepare, atfork_parent, atfork_child);|\t(void)atfork_prepare; (void)atfork_parent; (void)atfork_child;|'
+mutant "a prepare handler that does not take the lock" "fork 50" \
+	's|static void atfork_prepare(void) { lock(); }|static void atfork_prepare(void) { }|'
+mutant "a child that does not re-stamp its magazine set" "fork 20" \
+	's|\t\ttc->owner = (int)syscall(SYS_gettid);|\t\t(void)0;|'
+
 # A dead thread's magazines, both halves: reclaiming them at all, and
 # reclaiming them to somewhere.
 mutant "magazines reclaimed only on adoption" "sweep" \
