@@ -399,6 +399,104 @@ else
 	printf 'SKIP span cache munmap count (strace not installed)\n'
 fi
 
+# ------------------------------------------------- the recorded corpus
+#
+# t/stress bench is six loops somebody wrote down as a guess at how programs
+# allocate. These two traces are not a guess: t/librecord.so is an LD_PRELOAD
+# that writes every allocator call a program makes, t/trace.py turns the
+# pointers into slot indices, and t/replay reissues the sequence against
+# whichever allocator is loaded. The allocator's own cost comes out separated
+# from the program's work, which timing the program end to end cannot do --
+# allocation is a few percent of what gcc spends its time on.
+#
+# Three things are asserted and only then is a number printed. The trace has
+# to be whole (its trailer must agree with what was read, and it must contain
+# no frees of pointers it never allocated). The replay has to reproduce it
+# exactly, under slab AND under glibc, which means every free finding its
+# slot occupied and every allocation finding it empty. And a replay that
+# skips one operation in sixteen has to be rejected, because otherwise a
+# replay that quietly dropped half the trace would report a lovely number.
+trace_one() {
+	_name=$1
+	shift
+	SLAB_TRACE="$T/tr/$_name" SLAB_TRACE_MAX=2000000 \
+		LD_PRELOAD="$PWD/t/librecord.so" "$@" >/dev/null 2>&1
+	# <prefix>.<pid>, one file per process, because gcc forks cc1 and as and
+	# they all inherit LD_PRELOAD. The largest is the one that did the work.
+	_raw=$(ls -S "$T/tr/$_name".* 2>/dev/null | head -1)
+	if [ -z "$_raw" ] || [ ! -s "$_raw" ]; then
+		bad "trace $_name: the recorder produced nothing"
+		return 1
+	fi
+	if ! python3 t/trace.py "$_raw" "$T/tr/$_name.slot" >"$T/tr/$_name.info" 2>&1; then
+		bad "trace $_name: t/trace.py refused it"
+		head -3 "$T/tr/$_name.info" | sed 's/^/        /'
+		return 1
+	fi
+	if grep -q 'MISMATCH\|NO TRAILER\|partial record' "$T/tr/$_name.info"; then
+		bad "trace $_name: incomplete"
+		grep 'MISMATCH\|NO TRAILER\|partial record' "$T/tr/$_name.info" | sed 's/^/        /'
+		return 1
+	fi
+	if ! grep -q 'trace: 0 frees and 0 reallocs' "$T/tr/$_name.info"; then
+		bad "trace $_name: it frees pointers it never allocated, so its lifetimes are not the program's"
+		grep 'never' "$T/tr/$_name.info" | sed 's/^/        /'
+		return 1
+	fi
+	ok "trace $_name: $(sed -n 's/^trace: \([0-9]* replayable.*\)/\1/p' "$T/tr/$_name.info")"
+	return 0
+}
+
+if [ -x ./t/replay ] && [ -f ./t/librecord.so ]; then
+	mkdir -p "$T/tr"
+	for _t in gcc py; do
+		case $_t in
+		gcc) trace_one gcc gcc -O2 -S -o /dev/null t/stress.c ;;
+		py)  cat >"$T/tr/j.py" <<'PYEOF'
+import json
+d = [{'i': i, 's': 'x' * (i % 500), 'n': [i, i*2, i*3]} for i in range(40000)]
+b = json.dumps(d)
+e = json.loads(b)
+print(len(b), sum(len(x['s']) for x in e))
+PYEOF
+		     trace_one py python3 "$T/tr/j.py" ;;
+		esac || continue
+		_s=$(LD_PRELOAD="$SLAB" ./t/replay "$T/tr/$_t.slot" 3 2>&1)
+		_g=$(./t/replay "$T/tr/$_t.slot" 3 2>&1)
+		if ! printf '%s' "$_s" | grep -q 'FAIL'; then
+			ok "replay $_t under slab: $(printf '%s' "$_s" | sed 's/^replay: //') vs glibc $(printf '%s' "$_g" | sed 's/.*= //')"
+		else
+			bad "replay $_t under slab did not reproduce the trace"
+			printf '%s\n' "$_s" | sed 's/^/        /'
+		fi
+		if printf '%s' "$_g" | grep -q 'FAIL'; then
+			bad "replay $_t under glibc did not reproduce the trace either, so the trace or the replay is wrong, not slab"
+			printf '%s\n' "$_g" | sed 's/^/        /'
+		else
+			ok "replay $_t under glibc reproduces it too, so the trace is sound"
+		fi
+	done
+
+	# Teeth for the faithfulness check: a replay that skips one operation in
+	# sixteen leaves frees landing on empty slots and allocations on
+	# occupied ones, and must be rejected rather than timed.
+	sed 's|\t\tfor (i = 1; i < nrec; i++) {|\t\tfor (i = 1; i < nrec; i++) { if ((i \& 15) == 0) continue;|' \
+		t/replay.c >"$T/rp.c"
+	if cmp -s "$T/rp.c" t/replay.c; then
+		bad "self-check lossy replay: sed did not apply (t/replay.c changed shape)"
+	elif ! gcc -std=gnu11 -O2 -o "$T/rp" "$T/rp.c" 2>"$T/rp.err"; then
+		bad "self-check lossy replay: did not compile"
+		head -2 "$T/rp.err" | sed 's/^/        /'
+	elif LD_PRELOAD="$SLAB" "$T/rp" "$T/tr/gcc.slot" 1 >/dev/null 2>&1; then
+		bad "self-check: a replay that skips one op in sixteen was ACCEPTED"
+	else
+		ok "self-check: the replay rejects itself when it skips one op in sixteen"
+	fi
+else
+	skipped=$((skipped + 1))
+	printf 'SKIP trace replay (t/replay or t/librecord.so missing; run make)\n'
+fi
+
 # ---------------------------------------------------------------- tier 3
 # Does tier 2 have teeth?  Build deliberately broken slabs and require the
 # oracle to reject each one.  A suite that cannot fail is not a suite, and
