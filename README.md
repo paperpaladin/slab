@@ -24,9 +24,17 @@ allocation. slab puts 64 bytes at the base of each 64 KiB span instead and
 finds it with one `AND`, which is 0.1% overhead instead of 100% on a 16-byte
 object. That is the footprint benchmark slab wins, and it wins it by 39%.
 
+What that costs instead is internal fragmentation, because an object is
+rounded to one of 32 size classes with nothing recording the request. That
+used to be an argument about the table in `slab.c`; it is now measured over
+every request size from 1 to 8192, and the worst case is 4097 bytes landing
+in the 5120 class, 19.98% of the allocation wasted. Below 129 bytes the
+classes are exact 16-byte steps and the worst slack is 15 bytes. See
+[Fragmentation](#fragmentation).
+
 ## The oracle
 
-`make test` runs 47 checks in three tiers.
+`make test` runs 53 checks in three tiers.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -51,7 +59,8 @@ threads with blocks handed between them so cross-thread `free` is exercised.
 The stress and semantic tests also run against glibc `malloc`, because if
 they fail there then the test is wrong, not slab.
 
-Two tier-2 checks are measurements rather than assertions about output.
+Three tier-2 checks are measurements rather than assertions about output.
+`t/stress frag` is described under [Fragmentation](#fragmentation).
 `t/stress reclaim` allocates 200 MB of 56-byte objects, dirties every byte,
 frees all of it, and reads resident size out of `/proc/self/statm` before,
 at the peak and after. slab gives back 94% of the peak. It also requires
@@ -71,7 +80,7 @@ asserts that too, because a guard assertion glibc also satisfied would be
 testing the C library rather than the reservation.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
-fifteen deliberately broken slabs: objects that overlap by 8 bytes, a
+eighteen deliberately broken slabs: objects that overlap by 8 bytes, a
 `calloc` that never zeroes, a `realloc` that copies half the bytes, a class
 index one too small for one octave, magazines with no adoption, a `realloc`
 that moves a large block instead of growing it, a reserved tail mapped
@@ -80,9 +89,12 @@ block that keeps its grown size when freed, a shrink that drops the pages
 but leaves the tail writable, a wholly free span that is never given back, a
 reclaim that re-arms a span without the `madvise`, a reclaim that leaves the
 span's first page dirty, a displaced spare span reclaimed without checking
-it is still empty, and a span that is never relinked when it stops being
-full. Each must be rejected *by the check that owns that behaviour*, not
-merely by some check somewhere. That distinction is load-bearing; see below.
+it is still empty, a span that is never relinked when it stops being full, a
+size class widened until one octave wastes a third, a `malloc_stats` that
+does not subtract the magazines, and arenas that are never recorded so the
+dump sees no spans. Each must be rejected *by the check that owns that
+behaviour*, not merely by some check somewhere. That distinction is
+load-bearing; see below.
 
 Two things in `slab.c` cannot be mutation-tested and the README says so
 rather than leaving the impression that everything is covered: removing the
@@ -128,11 +140,14 @@ ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
 ok    peak RSS 1.09x glibc on a churn workload (limit 3.0x)
-ok    span reclaim: RSS 31028 -> 265316 -> 45776 KiB, 204800 KiB requested, 94% of the peak given back (glibc: 0% of the peak given back)
-ok    peak RSS 0.50x glibc on the byte-pattern stress (limit 1.2x)
+ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
+ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
+ok    fragmentation: glibc fails 9 of the per-size bounds, so they are slab's own
+ok    span reclaim: RSS 30896 -> 265248 -> 45708 KiB, 204800 KiB requested, 94% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.51x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
-ok    span cache: 200 large cycles cost 3 munmaps (glibc 2)
+ok    span cache: 200 large cycles cost 2 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
 ok    self-check: 'stress check' rejects a calloc that never zeroes
@@ -146,11 +161,14 @@ ok    self-check: 'stress guard' rejects a shrink that drops the pages but leave
 ok    self-check: 'stress reclaim 200' rejects a wholly free span that is never given back
 ok    self-check: 'stress reclaim 200' rejects a reclaim that re-arms the span without the madvise
 ok    self-check: 'stress reclaim 200' rejects a reclaim that leaves the span's first page dirty
+ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of its allocation
+ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
+ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (10.56x, limit 1.5x)
+ok    self-check: peak RSS rejects magazines with no adoption (10.53x, limit 1.5x)
 ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.64x, limit 1.2x)
 
-47 passed, 0 failed, 0 skipped
+53 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -345,6 +363,69 @@ leaves the pages resident and holding the last owner's bytes; `madvise`
 drops them but leaves the tail writable, so the guard would stop at the
 original end of any block that had ever grown. There is a mutant for each
 half.
+
+## Fragmentation
+
+A span-based allocator has no per-object header, which is the 39% footprint
+win above, and it pays for that in rounding: a request becomes one of 32
+class sizes and nothing records what was asked for. The README used to argue
+that four classes per octave above 128 bytes "caps internal fragmentation at
+1/5". It does, and `t/stress frag` now measures it rather than asserting it,
+over **every** request size from 1 to 8192 rather than a sample:
+
+```
+frag: worst case over 8192 sizes: 15 bytes of slack at or below 128,
+      and 4097 bytes requested in a 5120-byte class = 19.98% of the
+      allocation wasted
+frag: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the
+      allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live
+      objects)
+```
+
+glibc fails 9 of those per-size bounds, because `malloc_usable_size(malloc(1))`
+is 24 there against slab's 16, and the suite asserts that it fails: a bound
+both allocators satisfy would not be about slab's table.
+
+The second line comes from slab's own per-span accounting, which is what
+`malloc_stats(3)` prints. That was an empty stub until this was written, so
+slab had been silently reporting nothing where glibc reports something. The
+dump is one line per populated class plus a heat map -- one character per
+span, tenths of its capacity in use, `#` for full and `.` for empty:
+
+```
+slab: class=31 objsize=8192 spans=67 live=310 capacity=469 livebytes=2539520
+slab: heat 7575775757757557757577575757757577757777775777757775757577575775755
+slab: small live=2760 livebytes=11844288 magazined=0 magbytes=0 spans=301 \
+      mappedbytes=19726336 arenas=5 incomplete=0
+slab: spancache entries=0 commitbytes=0
+```
+
+Two things it is not. It is not triggered by a signal, which is what the PLAN
+asked for: the dump reads the class lists and the arena table, so it takes
+the lock, and a handler that takes a lock the interrupted thread may already
+hold deadlocks the process it was meant to diagnose. And there is no PNG or
+offline renderer, because a line of digits per class is already the heat map
+and a renderer would have no oracle behind it.
+
+It does not cover live large blocks, which are one `mmap` each with no list
+threaded through them; the only large accounting in the dump is the span
+cache. `malloc_info(3)` is also still glibc's, running against an arena slab
+does not use -- a real gap, not a claim.
+
+The accounting is checked by differencing two dumps, one before the workload
+and one with it live, so the C library's own startup allocations cancel
+instead of being guessed at. The delta in live objects must equal the number
+allocated **exactly**, and the delta in live bytes must equal the sum of
+`malloc_usable_size` over the same blocks exactly: the same quantity reached
+by two unrelated routes, per-span counters against per-object class lookups.
+
+That exactness immediately found a defect in the dump. `h->live` counts an
+object from the moment it leaves the bump pointer until it is handed back to
+its span, so objects sitting on a thread's magazine -- already freed by the
+program -- were reported as live. The first run said 19977 where 20000 were
+expected, and the 23 were magazine stock left over from the size sweep that
+runs before it. A fragmentation report that calls freed objects live is
+wrong, so the magazines are walked and reported separately now.
 
 ## Sanitizers, and what they cannot reach
 
