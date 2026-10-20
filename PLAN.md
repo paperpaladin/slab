@@ -82,20 +82,42 @@ Ranked by how much it would embarrass us to fail it.
 6b. LD_PRELOAD interposition, checked first. `malloc_usable_size(malloc(1))`
    is compared with and without the preload, before any allocator behaviour is
    asserted. Without it the entire suite was green against a library that
-   defines no `malloc`: a `libslab.so` built from one unused variable passes
-   31 of the 32 checks, including the RSS ratios, the span-cache munmap count
-   and all five mutants. This was missing from the Oracle list entirely, and
-   it is the one check everything else depends on.
+   defines no `malloc`: a `libslab.so` built from one unused variable passed
+   31 of the 32 checks of the day, including the RSS ratios, the span-cache
+   munmap count and every mutant. This was missing from the Oracle list
+   entirely, and it is the one check everything else depends on. Each mutant
+   is now held to the same standard: the built mutant has to change that
+   number, or rejecting it proves nothing.
 
-7. Mutation self-check. `make test` builds five deliberately broken
-   slabs, overlapping objects, a `calloc` that never zeroes, a `realloc`
+6c. The reserved tail, `t/stress guard`. The one slab-specific mode, and the
+   one place the kernel is the oracle directly: the permissions of the tail
+   mapping are read back out of `/proc/self/maps` and have to be `---p`, and
+   a byte written past the end of a block has to kill a forked child with
+   SIGSEGV. `mprotect` returning 0 is not evidence. It also asserts that
+   `realloc` returns THE SAME POINTER for a large block that quadrupled,
+   which is the "did the new path run" check -- a reservation nobody grows
+   into is invisible everywhere else -- and that a grown block comes back out
+   of the span cache at its original size with its guard restored. glibc
+   fails all eight of its assertions, and the suite asserts that, because an
+   assertion glibc also satisfied would be about the C library.
+
+7. Mutation self-check. `make test` builds ten deliberately broken
+   slabs: overlapping objects, a `calloc` that never zeroes, a `realloc`
    that copies half the bytes, a class index one too small for one octave,
-   and magazines with no adoption (this list named four of the five),
-   and requires each to be rejected *by the check that owns that behaviour*,
+   magazines with no adoption, a `realloc` that moves a large block instead
+   of growing it, a reserved tail mapped writable instead of `PROT_NONE`, a
+   reservation that is never taken, a grown block that keeps its grown size
+   when freed, and a shrink that drops the pages but leaves the tail
+   writable. Each must be rejected *by the check that owns that behaviour*,
    not merely by some check somewhere. A suite that cannot fail is not a
    suite, and this is not hypothetical: it is how we found that gcc was
    deleting the `calloc` zero-check as a provable tautology, and the
    ownership requirement is what made it visible instead of masked by the fuzzer catching it incidentally.
+   The harness itself was fooled once, by sed rather than by slab: `|` is both
+   sed's delimiter and a C operator, so an expression containing
+   `PROT_READ | PROT_WRITE` exited 1 and left an empty mutant source, which
+   compiles into a library with no `malloc` and is duly "rejected" by every
+   mode.
 8. Footprint. Peak RSS under the preload compared against glibc on a
    churn workload, bounded at 3x. Makes the "never returns memory to the OS"
    shortcut a measured number, not a footnote.
@@ -105,9 +127,17 @@ Ranked by how much it would embarrass us to fail it.
 - Beating glibc. glibc's `malloc` has per-thread tcaches, per-thread arenas
   and twenty years of tuning. A 300-line allocator with one global lock will
   lose, and the README says where.
-- Hardening. No guard pages, no free-list pointer mangling, no double-free
-  detection, no canaries. A double free corrupts the free list silently.
-- Returning memory to the OS. Spans are mapped once and kept.
+- Hardening, with one accident. No free-list pointer mangling, no
+  double-free detection, no canaries; a double free corrupts the free list
+  silently. The exception arrived as a side effect of growing large blocks
+  in place: every large mapping of 128 KiB or more now ends in a `PROT_NONE`
+  reservation, so a write past the end of such a block faults instead of
+  landing in page-rounding slack. That is a real guard page and it is tested
+  as one, but it covers only large blocks, only past the end of the page the
+  payload ends in, and it was not the point.
+- Returning memory to the OS. Spans are mapped once and kept. The one place
+  memory does go back is `madvise(MADV_DONTNEED)` on the part of a large
+  mapping a `realloc` had grown into, when that block is freed.
 - Debugging features: no leak tracking, no `mtrace`, no allocation logging.
 - Non-glibc platforms, non-x86-64 architectures, 32-bit, or kernels whose
   page size is not 4096.
@@ -219,11 +249,72 @@ Ranked by how much it would embarrass us to fail it.
         claim about syscalls and nothing in a program's output can see it:
         200 large alloc/free cycles cost 601 munmaps before and 3 after, with
         glibc at 2. Disabling the cache fails that assertion and nothing else.
-- [ ] Grow large blocks without copying: reserve a `PROT_NONE` tail per
+- [x] Grow large blocks without copying: reserve a `PROT_NONE` tail per
       large mapping and `mprotect` it in on growth.
       - why: `realloc`-grow is 72x slower than glibc. Every doubling past
         8 KiB is a fresh `mmap` plus a full `memcpy` plus a `munmap`, where
         glibc gets an `mremap` page-table edit.
+      - the 72x was already stale when this item came up: the span cache had
+        taken `realloc-grow` to 2.9x glibc, because that benchmark stops at
+        64 KiB and the cache serves every size in it. So the first thing
+        this needed was a benchmark that reaches the case the item is about.
+        New `large-grow` row: a buffer doubled from 16 KiB to 4 MiB, eight
+        large-to-large steps where `realloc-grow` has two. Measured before
+        any change: 189355 ns/op against glibc's 877, which is 216x, and
+        13.5x jemalloc and 11.0x tcmalloc.
+      - done: 189355 -> 2274 ns/op, 2.6x glibc, and 6.4x FASTER than
+        jemalloc and 7.1x faster than tcmalloc. Measured against the
+        previous commit in one interleaved run of ten repetitions each
+        (207606 -> 2818, a factor of 74); the other five rows moved 1.01x to
+        1.06x, and the 1.06x on large-block churn is repeatable and is one
+        extra `mprotect` per large allocation. Peak RSS on the churn
+        workload went 1.10x -> 1.09x glibc. The address-space cost is the
+        real one: `VmPeak` 34 MB -> 996 MB on a 64-live-large-block
+        workload, with `VmHWM` 1648 kB either way.
+      - two knobs, both set by measurement and not by reasoning.
+        `RESERVE_MIN` = 128 KiB, because the `mprotect` pair costs more than
+        the copy below that: with no floor, `realloc-grow` went 151 -> 638
+        ns/op, and the measured floors are 1 -> 638, 16 KiB -> 677,
+        32 KiB -> 533, 64 KiB -> 155, 128 KiB -> 151. `RESERVE_K` = 31, so a
+        mapping is 32x its request and a buffer doubles five times before it
+        has to move; the `large-grow` row is bimodal in this because its
+        chain spans exactly 32x from the first reserved block, which is
+        written down in the README rather than quietly tuned into.
+      - the bug it introduced, and the one worth remembering: a grown
+        mapping went into the span cache at its grown size, nothing ever
+        matched it again, and 200 rounds of the `realloc-grow` loop went
+        from 17 `mmap`s and 9 `munmap`s to 214 and 587. `free` now restores
+        a grown block to the size it was mapped with, which needs BOTH
+        `madvise(MADV_DONTNEED)` (the pages) and `mprotect(PROT_NONE)` (the
+        guard), and there is a mutant for each half. `make test` holds the
+        syscall count down with `strace`, because nothing in a program's
+        output can see it.
+      - the oracle: `t/stress guard`, the one slab-specific mode in the
+        suite. It asserts that `realloc` returns THE SAME POINTER for a
+        large block that quadrupled (a reservation nobody grows into is
+        invisible in every other check), that the kernel reports the tail
+        as `---p` in `/proc/self/maps`, that writing one byte past the end
+        kills a forked child with SIGSEGV, and that a grown block is
+        recycled at its original size with its guard back. glibc fails all
+        eight of its assertions and the suite asserts that too. Five new
+        mutants, one per behaviour, all caught.
+      - the harness bug found on the way: `|` is both sed's delimiter and a
+        C operator, so the mutant expression containing `PROT_READ |
+        PROT_WRITE` made sed exit 1 and leave an EMPTY mutant source, which
+        compiles into a library with no `malloc` and is "rejected" by every
+        mode. It read as a confirmation. `mutant()` now checks sed's exit
+        status and requires the built mutant to change
+        `malloc_usable_size(malloc(1))`; both halves have been watched to
+        fail.
+      - BLOCKED, honestly: no AddressSanitizer number for slab. ASan needs
+        its runtime first in the initial library list and then its own
+        `malloc` interposes ahead of ours (`t/stress interposed` prints 1,
+        not 16), so the suite would pass while testing ASan's allocator.
+        UBSan does not replace `malloc` and was run against slab instead:
+        clean on all five modes and under `ls`, `sort`, CPython and `gcc`.
+        ASan was run against the oracle, where it belongs, and it reports
+        `guard`'s deliberate past-the-end write as a heap-buffer-overflow,
+        which is independent confirmation that the byte is out of bounds.
 - [ ] Return memory with `madvise(MADV_DONTNEED)` once a span is wholly
       free, keeping the mapping so the AND-mask lookup still works.
       - why: peak RSS is currently sticky forever; a program with a large
