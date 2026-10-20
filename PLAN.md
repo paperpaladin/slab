@@ -709,8 +709,50 @@ Ranked by how much it would embarrass us to fail it.
         did-sed-apply guard turned the suite red rather than printing a
         pass for a mutant that was never built, for the second time in this
         milestone.
-- [ ] Shrink large blocks in place on `realloc` down, `munmap`ing the tail.
+- [x] Shrink large blocks in place on `realloc` down, giving the tail back.
       - why: `realloc(p_1MB, 100)` keeps a megabyte resident today.
+      - done, and NOT with munmap, which is what this item said. Unmapping
+        the tail punches a hole in the middle of a mapping slab still owns:
+        it costs the block its PROT_NONE reservation and so its ability to
+        grow again, and leaves map_len describing something that is no
+        longer there. Decommitting it instead -- the mprotect and madvise
+        pair already used when a grown block is freed -- gives the pages
+        back, keeps the guard at the block's new end, and leaves the
+        reservation intact.
+      - measured on a 64 MiB block trimmed to 1000 bytes: resident 69204 ->
+        69384 KiB before (nothing returned), 69272 -> 3796 KiB after. glibc
+        gets to 1580, jemalloc to 2868 and moves the block,
+        tcmalloc_minimal returns nothing at all (72908 -> 72972).
+      - IT COST 33% OF THE CPYTHON REPLAY AND THE CAUSE WAS NOT THE
+        SYSCALLS. The first version moved commit0 -- the size the mapping
+        was made at, which is what the span cache matches a freed mapping
+        on -- down with the trim. A trimmed block then went into the cache
+        at its trimmed size, never matched the next request for the size it
+        was made at, and the workload paid a fresh mmap and several hundred
+        page faults. ONE realloc down in the whole recorded trace took that
+        replay from 150 to 199 ns/op. The trace itself is what found it:
+        counting the reallocs in it showed 15 large shrinks, one of which
+        frees more than 128 KiB, which is nowhere near enough to be a
+        syscall cost, and that is what sent the search in the right
+        direction instead of raising SHRINK_MIN until the number went away.
+      - the fix generalises what was big_shrink into big_restore: on the way
+        into the cache a block goes back to commit0 whichever side of it it
+        is on. Grown needs both syscalls; trimmed needs only the mprotect,
+        because the pages are already gone. After it: 0.92x to 1.05x on the
+        six rows and both replays, fifteen alternated repetitions.
+      - and it is checked by mechanism rather than by timing, because the
+        suite asserts none: after the trim and a free, asking for the size
+        the block was made at has to return THAT MAPPING. The mutant that
+        skips the restore gives a different pointer.
+      - four mutants, all caught by the assertion that owns them: not
+        trimming at all (the resident drop), trimming without the mprotect
+        (the guard at the new end), restoring without the mprotect (the
+        guard after reuse), and not restoring a trimmed block (the span
+        cache hit).
+      - SHRINK_MIN is RESERVE_MIN, 128 KiB, for the same reason: below that
+        the two syscalls and the refault cost more than the pages are worth.
+        realloc(p_1MB, 100) from this item's own example is fixed;
+        realloc(p_100KB, 100) is not, and the README says so.
 - [ ] Optional free-list pointer mangling and a cheap double-free check,
       behind a compile-time flag.
       - why: a double free currently corrupts the free list into a cycle

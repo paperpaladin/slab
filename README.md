@@ -34,7 +34,7 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 73 checks in three tiers, plus a recorded corpus.
+`make test` runs 76 checks in three tiers, plus a recorded corpus.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -86,7 +86,7 @@ against glibc, with the replay required to reproduce the trace exactly
 before any timing from it is believed.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
-twenty-six deliberately broken slabs: objects that overlap by 8 bytes, a
+twenty-nine deliberately broken slabs: objects that overlap by 8 bytes, a
 `calloc` that never zeroes, a `realloc` that copies half the bytes, a class
 index one too small for one octave, magazines with no adoption, a `realloc`
 that moves a large block instead of growing it, a reserved tail mapped
@@ -103,7 +103,9 @@ span instead of a huge page, magazines reclaimed only on adoption, a
 sweep that drops a dead thread's magazines instead of returning them, no
 `pthread_atfork` handlers at all, a prepare handler that does not take the
 lock, a child that does not re-stamp its magazine set, and a
-page size that is not the kernel's. Each must be rejected *by the check that owns that
+page size that is not the kernel's, a `realloc` down that keeps the whole
+mapping resident, a trim that drops the pages but leaves them writable, and
+a trimmed block that never goes back to its mapped size. Each must be rejected *by the check that owns that
 behaviour*, not merely by some check somewhere. That distinction is
 load-bearing; see below.
 
@@ -150,26 +152,26 @@ ok    guard: glibc fails 8 of its assertions, so none of them is free
 ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
-ok    peak RSS 1.10x glibc on a churn workload (limit 3.0x)
+ok    peak RSS 1.12x glibc on a churn workload (limit 3.0x)
 ok    fork: a multithreaded process forks and the child allocates
 ok    fork: glibc malloc survives it too, so the oracle is right
-ok    magazine sweep: 64 dead threads held 11077 KiB on their magazines, 7 KiB left after the next arena was wanted
+ok    magazine sweep: 64 dead threads held 11087 KiB on their magazines, 7 KiB left after the next arena was wanted
 ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
 ok    geometry: page=4096, span=65536 (sysconf says 4096, AT_PAGESZ says 4096)
 ok    fragmentation: glibc fails 9 of its assertions, so they are about slab's own table and geometry
-ok    span reclaim: RSS 33056 -> 265488 -> 45948 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
-ok    peak RSS 0.70x glibc on the byte-pattern stress (limit 1.2x)
+ok    span reclaim: RSS 32972 -> 266444 -> 46904 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.60x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
 ok    span cache: 200 large cycles cost 2 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
-ok    trace gcc: 827690 replayable ops, 10963 slots (peak live blocks), 399454 KiB requested
-ok    replay gcc under slab: 2483070 ops in 0.098s = 39.5 ns/op (3 reps, 10963 slots) vs glibc 39.5 ns/op (3 reps, 10963 slots)
+ok    trace gcc: 836300 replayable ops, 11157 slots (peak live blocks), 407649 KiB requested
+ok    replay gcc under slab: 2508900 ops in 0.130s = 51.9 ns/op (3 reps, 11157 slots) vs glibc 25.5 ns/op (3 reps, 11157 slots)
 ok    replay gcc under glibc reproduces it too, so the trace is sound
 ok    trace py: 20083 replayable ops, 6305 slots (peak live blocks), 97208 KiB requested
-ok    replay py under slab: 60249 ops in 0.012s = 199.6 ns/op (3 reps, 6305 slots) vs glibc 379.3 ns/op (3 reps, 6305 slots)
+ok    replay py under slab: 60249 ops in 0.013s = 218.5 ns/op (3 reps, 6305 slots) vs glibc 306.8 ns/op (3 reps, 6305 slots)
 ok    replay py under glibc reproduces it too, so the trace is sound
 ok    self-check: the replay rejects itself when it skips one op in sixteen
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
@@ -180,7 +182,10 @@ ok    self-check: 'stress guard' rejects a realloc that moves a large block inst
 ok    self-check: 'stress guard' rejects a reserved tail that is mapped writable instead of PROT_NONE
 ok    self-check: 'stress guard' rejects a reservation that is never taken
 ok    self-check: 'stress guard' rejects a grown block that keeps its grown size when freed
-ok    self-check: 'stress guard' rejects a shrink that drops the pages but leaves the tail writable
+ok    self-check: 'stress guard' rejects a restore that drops the pages but leaves the tail writable
+ok    self-check: 'stress guard' rejects a realloc down that keeps the whole mapping resident
+ok    self-check: 'stress guard' rejects a trim that drops the pages but leaves them writable
+ok    self-check: 'stress guard' rejects a trimmed block that never goes back to its mapped size
 ok    self-check: 'stress reclaim 200' rejects a wholly free span that is never given back
 ok    self-check: 'stress reclaim 200' rejects a reclaim that re-arms the span without the madvise
 ok    self-check: 'stress reclaim 200' rejects a reclaim that leaves the span's first page dirty
@@ -196,10 +201,10 @@ ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of
 ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
 ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (11.15x, limit 1.5x)
-ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.83x, limit 1.2x)
+ok    self-check: peak RSS rejects magazines with no adoption (10.96x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.84x, limit 1.2x)
 
-73 passed, 0 failed, 0 skipped
+76 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -380,6 +385,47 @@ code measures. The check that separates them is peak RSS of the byte-pattern
 stress run: 0.51x glibc for the real thing against 1.67x for that mutant.
 It is in the suite now, with that mutant driving it, and it was added
 because the mutant survived everything else.
+
+### Shrinking, and a 33% regression with the wrong obvious cause
+
+`realloc(p, smaller)` used to return the same pointer and hold the whole
+mapping: read a file into a growing buffer, trim it to the length it turned
+out to be, and the peak stayed resident forever. It now hands the tail back
+-- `mprotect` then `madvise`, not `munmap`, because unmapping the tail would
+punch a hole in a mapping slab still owns and cost the block its
+reservation. On a 64 MiB block trimmed to 1000 bytes:
+
+```
+slab, before      69204 -> 69384 KiB     nothing returned
+slab, after       69272 ->  3796 KiB
+glibc             66932 ->  1580 KiB
+jemalloc 5        68276 ->  2868 KiB     (and it moved the block)
+tcmalloc_minimal  72908 -> 72972 KiB     nothing returned
+```
+
+The first version of this cost **33% of the recorded CPython replay**, and
+the obvious explanation -- two syscalls per trim -- was wrong. Counting the
+reallocs in the trace showed fifteen large shrinks, exactly one of which
+frees more than 128 KiB. One trim cannot cost 50 ns on every operation.
+
+What it had done was move `commit0`, the size the mapping was made at, down
+with the trim. `commit0` is what the span cache matches a freed mapping on,
+so a trimmed block went into the cache at its trimmed size, never matched
+the next request for the size it was made at, and the workload paid a fresh
+`mmap` and several hundred page faults. Had the trace not been there to
+count, the fix would have been to raise the threshold until the number went
+away.
+
+A block now goes back to `commit0` on the way into the cache from whichever
+side it is on: grown needs both syscalls, trimmed needs only the `mprotect`
+because the pages are already gone. After that, 0.92x to 1.05x everywhere.
+The check is the mechanism rather than the timing, since this suite asserts
+none: after a trim and a free, asking for the size the block was made at has
+to return **that mapping**.
+
+Below 128 KiB of saving the tail is kept, because the two syscalls and the
+refault cost more than the pages are worth. `realloc(p_1MB, 100)` is fixed;
+`realloc(p_100KB, 100)` is not.
 
 ### The bug the reservation introduced
 
