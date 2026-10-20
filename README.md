@@ -34,7 +34,7 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 60 checks in three tiers, plus a recorded corpus.
+`make test` runs 63 checks in three tiers, plus a recorded corpus.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -86,7 +86,7 @@ against glibc, with the replay required to reproduce the trace exactly
 before any timing from it is believed.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
-eighteen deliberately broken slabs: objects that overlap by 8 bytes, a
+twenty deliberately broken slabs: objects that overlap by 8 bytes, a
 `calloc` that never zeroes, a `realloc` that copies half the bytes, a class
 index one too small for one octave, magazines with no adoption, a `realloc`
 that moves a large block instead of growing it, a reserved tail mapped
@@ -97,8 +97,9 @@ reclaim that re-arms a span without the `madvise`, a reclaim that leaves the
 span's first page dirty, a displaced spare span reclaimed without checking
 it is still empty, a span that is never relinked when it stops being full, a
 size class widened until one octave wastes a third, a `malloc_stats` that
-does not subtract the magazines, and arenas that are never recorded so the
-dump sees no spans. Each must be rejected *by the check that owns that
+does not subtract the magazines, arenas that are never recorded so the dump
+sees no spans, arenas that never ask for huge pages, and arenas aligned to a
+span instead of a huge page. Each must be rejected *by the check that owns that
 behaviour*, not merely by some check somewhere. That distinction is
 load-bearing; see below.
 
@@ -121,7 +122,7 @@ to fail.
 ```
 $ make test
 ok    interposition: LD_PRELOAD replaces malloc (usable(malloc(1)) 24 -> 16)
-ok    ls -la /usr/bin (86606 bytes identical)
+ok    ls -la /usr/bin (90343 bytes identical)
 ok    ls -R /usr/include (101762 bytes identical)
 ok    ls error path (5 bytes identical)
 ok    cat /etc/services (12990 bytes identical)
@@ -145,21 +146,22 @@ ok    guard: glibc fails 8 of its assertions, so none of them is free
 ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
-ok    peak RSS 1.09x glibc on a churn workload (limit 3.0x)
+ok    peak RSS 1.12x glibc on a churn workload (limit 3.0x)
+ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
 ok    fragmentation: glibc fails 9 of the per-size bounds, so they are slab's own
-ok    span reclaim: RSS 30920 -> 265208 -> 45668 KiB, 204800 KiB requested, 94% of the peak given back (glibc: 0% of the peak given back)
-ok    peak RSS 0.50x glibc on the byte-pattern stress (limit 1.2x)
+ok    span reclaim: RSS 33084 -> 266556 -> 47016 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.68x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
 ok    span cache: 200 large cycles cost 2 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
-ok    trace gcc: 619680 replayable ops, 9817 slots (peak live blocks), 322232 KiB requested
-ok    replay gcc under slab: 1859040 ops in 0.072s = 39.0 ns/op (3 reps, 9817 slots) vs glibc 22.3 ns/op (3 reps, 9817 slots)
+ok    trace gcc: 665124 replayable ops, 10251 slots (peak live blocks), 342012 KiB requested
+ok    replay gcc under slab: 1995372 ops in 0.068s = 34.0 ns/op (3 reps, 10251 slots) vs glibc 22.8 ns/op (3 reps, 10251 slots)
 ok    replay gcc under glibc reproduces it too, so the trace is sound
 ok    trace py: 20090 replayable ops, 6312 slots (peak live blocks), 97209 KiB requested
-ok    replay py under slab: 60270 ops in 0.009s = 156.1 ns/op (3 reps, 6312 slots) vs glibc 259.6 ns/op (3 reps, 6312 slots)
+ok    replay py under slab: 60270 ops in 0.009s = 151.3 ns/op (3 reps, 6312 slots) vs glibc 264.4 ns/op (3 reps, 6312 slots)
 ok    replay py under glibc reproduces it too, so the trace is sound
 ok    self-check: the replay rejects itself when it skips one op in sixteen
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
@@ -174,14 +176,16 @@ ok    self-check: 'stress guard' rejects a shrink that drops the pages but leave
 ok    self-check: 'stress reclaim 200' rejects a wholly free span that is never given back
 ok    self-check: 'stress reclaim 200' rejects a reclaim that re-arms the span without the madvise
 ok    self-check: 'stress reclaim 200' rejects a reclaim that leaves the span's first page dirty
+ok    self-check: 'stress huge' rejects arenas that never ask for huge pages
+ok    self-check: 'stress huge' rejects arenas aligned to a span instead of a huge page
 ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of its allocation
 ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
 ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (10.61x, limit 1.5x)
-ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.65x, limit 1.2x)
+ok    self-check: peak RSS rejects magazines with no adoption (11.24x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.86x, limit 1.2x)
 
-60 passed, 0 failed, 0 skipped
+63 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -454,6 +458,54 @@ The recorded program touched its memory in some pattern the trace does not
 carry, so page-fault and cache behaviour here is the replay's, not the
 program's. What carries over exactly is the sequence of sizes and the
 lifetimes.
+
+## Huge pages, and a win none of the benchmarks could see
+
+Arenas are 4 MiB, which is exactly the shape a transparent huge page wants,
+so they are 2 MiB-aligned and `madvise(MADV_HUGEPAGE)`'d. The alignment is
+not decoration: the kernel can only back a 2 MiB-aligned region, and a
+span-aligned arena gets half of itself covered.
+
+**Every benchmark in this README is blind to it.** All six synthetic rows
+and both trace replays move by less than their run-to-run spread, because
+they write one byte per block and move on, and a TLB entry is wasted on that
+either way. The first measurement said 5% on small churn, and a three-way
+run against a build with the alignment but no `madvise` showed the 5%
+belonged to neither -- it was noise.
+
+The workload that can see it is random access over a large live set, which
+is `t/stress tlb`: 2 million live 64-byte objects, 20 million random reads.
+Medians of three, ns per access, with the kernel's own `AnonHugePages`
+figure beside them:
+
+```
+glibc                49.3 ns      0 KiB huge    173 MB resident
+jemalloc 5           47.3 ns      0 KiB         148 MB
+tcmalloc_minimal     45.3 ns      0 KiB         149 MB
+slab, before         44.3 ns      0 KiB         142 MB
+slab, after          38.3 ns    126976 KiB      144 MB
+```
+
+16% against slab's own previous commit and 23% against glibc, and slab is
+still the smallest resident of the five.
+
+The oracle is the kernel rather than the return value: `MADV_HUGEPAGE` is
+advice and returns 0 on a kernel with `transparent_hugepage=never`, so the
+check reads `AnonHugePages` out of `/proc/self/smaps_rollup` and demands
+three quarters of the bytes asked for. It skips itself, loudly and counted,
+when THP is not in `madvise` mode, because with `never` nothing can be
+backed and with `always` every allocator gets huge pages without asking.
+
+### What it costs, on the shape it is worst for
+
+A churn over every size class leaving one block in eight live: **6.37 GB
+resident becomes 6.83 GB, 7.2% worse**. And `span_reclaim`'s `MADV_DONTNEED`
+then splits nearly all of those huge pages apart again -- 2 MB of
+`AnonHugePages` survived out of 6.8 GB -- so that workload pays the cost and
+keeps none of the benefit. Returning memory and huge pages are in tension,
+and that is the measurement of by how much. In the suite, peak RSS on the
+Python churn goes from 1.09x to 1.12x glibc against a 3.0x limit, and on the
+byte-pattern stress from 0.50x to 0.68x against a 1.2x limit.
 
 ## Fragmentation
 

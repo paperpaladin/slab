@@ -489,6 +489,97 @@ static void *worker(void *arg)
 	return NULL;
 }
 
+/* ---------------- huge mode ----------------
+ *
+ * SLAB-SPECIFIC, and the kernel is the oracle: AnonHugePages in
+ * /proc/self/smaps_rollup is the kernel saying how much of this process is
+ * actually backed by 2 MiB pages.  mmap and madvise returning 0 says
+ * nothing -- MADV_HUGEPAGE is advice, and on a kernel with
+ * transparent_hugepage=never it is advice that is ignored.
+ *
+ * That is also why the mode SKIPS rather than fails when THP is off or
+ * set to "always": with "never" nothing can be backed, and with "always"
+ * every allocator gets huge pages without asking and the check would be
+ * about the kernel's default rather than about slab's madvise.
+ */
+static int thp_madvise_mode(void)
+{
+	FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
+	char line[128] = "";
+
+	if (!f)
+		return 0;
+	if (!fgets(line, sizeof line, f))
+		line[0] = 0;
+	fclose(f);
+	return strstr(line, "[madvise]") != NULL;
+}
+
+static long smaps_rollup(const char *key)
+{
+	FILE *f = fopen("/proc/self/smaps_rollup", "r");
+	char line[256];
+	long v = -1;
+
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof line, f))
+		if (!strncmp(line, key, strlen(key))) {
+			if (sscanf(line + strlen(key), "%ld", &v) != 1)
+				v = -1;
+			break;
+		}
+	fclose(f);
+	return v;
+}
+
+static void check_huge(long nobj)
+{
+	void **v;
+	long i, before, after, want;
+
+	if (!thp_madvise_mode()) {
+		printf("huge: SKIP, transparent_hugepage is not in madvise "
+		       "mode, so MADV_HUGEPAGE proves nothing either way\n");
+		return;
+	}
+	v = malloc((size_t)nobj * sizeof *v);
+	CHECK(v != NULL, "could not allocate the slot array");
+	if (!v)
+		return;
+	memset(v, 0, (size_t)nobj * sizeof *v);
+	before = smaps_rollup("AnonHugePages:");
+	CHECK(before >= 0, "no AnonHugePages line in /proc/self/smaps_rollup");
+	if (before < 0)
+		return;
+	for (i = 0; i < nobj; i++) {
+		v[i] = malloc(64);
+		if (!v[i]) {
+			CHECK(0, "malloc(64) failed at object %ld", i);
+			return;
+		}
+		*(unsigned char *)v[i] = 1;
+	}
+	after = smaps_rollup("AnonHugePages:");
+	/* Three quarters of the bytes asked for.  Measured at 26624 KiB for
+	 * 25000 KiB of objects, so 1.4x of headroom for a kernel that cannot
+	 * find a free 2 MiB block for every arena -- and tight enough to
+	 * catch the mutant that aligns arenas to a span instead of a huge
+	 * page, which still gets 12288 KiB (49%) because a 4 MiB region
+	 * happens to contain one aligned 2 MiB block wherever it starts.
+	 * A quarter was the first threshold here and that mutant survived it. */
+	want = nobj * 64 / 1024 * 3 / 4;
+	printf("huge: AnonHugePages %ld -> %ld KiB over %ld KiB of 64-byte "
+	       "objects\n", before, after, nobj * 64 / 1024);
+	CHECK(after - before >= want,
+	      "the kernel backed %ld KiB with huge pages where at least %ld "
+	      "was expected: MADV_HUGEPAGE on the arenas is not taking effect",
+	      after - before, want);
+	for (i = 0; i < nobj; i++)
+		free(v[i]);
+	free(v);
+}
+
 /* ---------------- frag mode ----------------
  *
  * SLAB-SPECIFIC. The README argues that four size classes per octave above
@@ -945,6 +1036,51 @@ static void report(const char *name, double secs, long ops)
 	printf("%-22s %8.1f ns/op\n", name, secs / ops * 1e9);
 }
 
+/*
+ * Mode `tlb`: random reads over a large live working set, which is the only
+ * shape in which a huge page can pay for itself and the one `bench` cannot
+ * see.  Every row of `bench` writes one byte per block and moves on, so a
+ * TLB entry is wasted on it either way and MADV_HUGEPAGE moves those six
+ * numbers by less than their run-to-run spread.  This moves by 16%.
+ *
+ * Not asserted, because it is a timing and this suite asserts none.  It
+ * exists so the number in the README can be re-measured:
+ *
+ *     ./t/stress tlb                       (glibc)
+ *     LD_PRELOAD=./libslab.so ./t/stress tlb
+ */
+static void check_tlb(long nobj, long naccess)
+{
+	unsigned char **v = malloc((size_t)nobj * sizeof *v);
+	unsigned long s = 12345, acc = 0;
+	long i;
+	double t0;
+
+	CHECK(v != NULL, "could not allocate the slot array");
+	if (!v)
+		return;
+	for (i = 0; i < nobj; i++) {
+		v[i] = malloc(64);
+		if (!v[i]) {
+			CHECK(0, "malloc(64) failed at object %ld", i);
+			return;
+		}
+		memset(v[i], (int)i, 64);
+	}
+	t0 = now();
+	for (i = 0; i < naccess; i++) {
+		s = s * 6364136223846793005UL + 1442695040888963407UL;
+		acc += v[(s >> 20) % (unsigned long)nobj][(s >> 3) & 63];
+	}
+	printf("tlb: %.1f ns/access over %ld live 64-byte objects, "
+	       "AnonHugePages %ld KiB, Rss %ld KiB (checksum %lu)\n",
+	       (now() - t0) / (double)naccess * 1e9, nobj,
+	       smaps_rollup("AnonHugePages:"), smaps_rollup("Rss:"), acc);
+	for (i = 0; i < nobj; i++)
+		free(v[i]);
+	free(v);
+}
+
 static void bench_small(long iters)
 {
 	void *v[1024] = {0};
@@ -1138,6 +1274,10 @@ int main(int argc, char **argv)
 
 	if (!strcmp(mode, "guard")) {
 		check_guard();
+	} else if (!strcmp(mode, "tlb")) {
+		check_tlb(n ? n : 2000000, 20000000);
+	} else if (!strcmp(mode, "huge")) {
+		check_huge(n ? n : 400000);
 	} else if (!strcmp(mode, "frag")) {
 		check_frag(argc > 2 ? argv[2] : "frag.txt");
 	} else if (!strcmp(mode, "reclaim")) {
@@ -1190,8 +1330,8 @@ int main(int argc, char **argv)
 		return 0;
 	} else {
 		fprintf(stderr,
-			"usage: stress check|guard|reclaim|frag PATH|stress|"
-			"thread|tchurn|bench [n]\n");
+			"usage: stress check|guard|reclaim|huge|tlb|frag PATH|"
+			"stress|thread|tchurn|bench [n]\n");
 		return 2;
 	}
 

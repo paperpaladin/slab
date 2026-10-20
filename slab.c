@@ -55,6 +55,7 @@
 #define NCLASS     32
 #define MAXSMALL   8192u            /* above this, one mmap per allocation */
 #define ARENA_LEN  (4u * 1024u * 1024u)   /* spans are carved from arenas */
+#define HUGE_PAGE  (2u * 1024u * 1024u)   /* x86-64 PMD; arenas align to it */
 #define MAGIC      0x5b1ab10cu
 #define CLS_LARGE  0xffffu
 
@@ -335,21 +336,25 @@ static struct hdr *hdr_of(void *p)
  * if that is got wrong -- its last assertion is that an unreserved large
  * block faults one byte past its end.
  */
-static void *map_aligned(size_t len, int prot, size_t *got)
+static void *map_aligned_to(size_t len, int prot, size_t *got, size_t al)
 {
-	void *r = mmap(NULL, len + SPAN_SIZE, prot,
-		       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	void *r = mmap(NULL, len + al, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (r == MAP_FAILED)
 		return NULL;
-	uintptr_t a = ((uintptr_t)r + SPAN_MASK) & ~SPAN_MASK;
+	uintptr_t a = ((uintptr_t)r + al - 1) & ~(uintptr_t)(al - 1);
 	size_t front = a - (uintptr_t)r;
 	if (front)
 		munmap(r, front);
 	if (got)
-		*got = len + (SPAN_SIZE - front);
-	else if (SPAN_SIZE - front)
-		munmap((void *)(a + len), SPAN_SIZE - front);
+		*got = len + (al - front);
+	else if (al - front)
+		munmap((void *)(a + len), al - front);
 	return (void *)a;
+}
+
+static void *map_aligned(size_t len, int prot, size_t *got)
+{
+	return map_aligned_to(len, prot, got, SPAN_SIZE);
 }
 
 /* shortcut: spans are never unmapped and never returned to the OS, so peak
@@ -361,9 +366,43 @@ static void *map_aligned(size_t len, int prot, size_t *got)
 static struct hdr *span_new(unsigned cls)
 {
 	if (arena_cur == arena_end) {
-		char *a = map_aligned(ARENA_LEN, PROT_READ | PROT_WRITE, NULL);
+		/*
+		 * Arenas are 2 MiB-aligned and asked for huge pages.  A 4 MiB
+		 * arena is exactly the shape a transparent huge page wants,
+		 * and the alignment is not optional: the kernel can only back
+		 * a 2 MiB-aligned region, so a span-aligned arena would get
+		 * at most half of itself covered.  The extra trimming costs
+		 * one over-map of 2 MiB instead of 64 KiB, once per 4 MiB.
+		 *
+		 * WHAT IT IS WORTH, measured, because this is the sort of
+		 * thing that gets switched on for the sound of it.  The
+		 * allocator benchmarks cannot see it at all -- they write one
+		 * byte per block, and a TLB entry is wasted on that either
+		 * way -- and the six rows move by less than the run-to-run
+		 * noise.  What it buys is the PROGRAM's accesses: random
+		 * reads over 2 million live 64-byte objects go from 55.5 to
+		 * 46.7 ns, repeatably, 16% faster, with /proc/self/smaps_rollup
+		 * confirming 127 MB of AnonHugePages where there had been
+		 * none.  2 MiB alignment on its own, without the madvise,
+		 * accounts for none of it (54.0 ns).
+		 *
+		 * shortcut: it is unconditional.  Ceiling: a sparse workload
+		 * faults in whole 2 MiB regions for a few live objects and
+		 * pays for it -- 6.37 GB resident becomes 6.83 GB, 7.2%, on a
+		 * churn over every size class -- and then span_reclaim()'s
+		 * MADV_DONTNEED splits nearly all of those huge pages apart
+		 * again (2 MB of AnonHugePages survived out of 6.8 GB), so
+		 * that workload pays the cost and keeps none of the benefit.
+		 * The two features are in tension and the measurement says by
+		 * how much.  Upgrade path: madvise an arena only once its
+		 * spans are densely occupied, or MADV_NOHUGEPAGE a span on
+		 * reclaim.
+		 */
+		char *a = map_aligned_to(ARENA_LEN, PROT_READ | PROT_WRITE,
+					 NULL, HUGE_PAGE);
 		if (!a)
 			return NULL;
+		madvise(a, ARENA_LEN, MADV_HUGEPAGE);
 		arena_cur = a;
 		arena_end = a + ARENA_LEN;
 		if (narena < ARENA_MAX)

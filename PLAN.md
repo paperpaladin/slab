@@ -543,10 +543,55 @@ Ranked by how much it would embarrass us to fail it.
         itself was also built with -fsanitize=address,undefined and run,
         because it indexes a slot array out of a mapped file, and the
         recorder was built with UBSan and used to record ls -R.
-- [ ] `madvise(MADV_HUGEPAGE)` on arenas and a measurement of whether it
+- [x] `madvise(MADV_HUGEPAGE)` on arenas and a measurement of whether it
       helps or hurts.
       - why: 4 MiB arenas are exactly the shape THP wants; worth knowing
         whether the TLB win beats the zeroing cost.
+      - it helps, by 16%, and NONE of the existing benchmarks can see it.
+        Every row of `bench` writes one byte per block and moves on, so a
+        TLB entry is wasted on it either way, and all six rows plus both
+        trace replays moved by less than their run-to-run spread. The first
+        measurement said 0.949x on small-churn and that did not reproduce;
+        a three-way run against a build with 2 MiB-aligned arenas and no
+        madvise said 0.937x for the ALIGNMENT and 1.014x for the huge
+        pages, which is the shape of noise and not of a cause.
+      - the workload that can see it is random access over a large live
+        set, which is now `stress tlb`: 2 million live 64-byte objects,
+        20 million random reads. Medians of three, ns per access, with the
+        kernel's own AnonHugePages figure beside them:
+
+          glibc 49.3 (0 KiB huge)      jemalloc 47.3 (0)
+          tcmalloc 45.3 (0)            slab before 44.3 (0)
+          slab after 38.3 (126976 KiB)
+
+        16% against slab's own previous commit and 23% against glibc, with
+        slab also the smallest resident of the five (144 MB against glibc's
+        173 MB).
+      - the alignment is load-bearing and not decoration: the kernel can
+        only back a 2 MiB-aligned region, so arenas are 2 MiB-aligned now
+        rather than span-aligned. The mutant that puts that back gets
+        12288 KiB of huge pages instead of 26624 -- half, because a 4 MiB
+        region contains one aligned 2 MiB block wherever it starts -- and
+        it SURVIVED the first version of the check, whose threshold was a
+        quarter of the bytes asked for. It is three quarters now.
+      - what it costs, measured on the shape it is worst for. A churn over
+        every size class leaving one block in eight live: 6.37 GB resident
+        becomes 6.83 GB, 7.2%. And span_reclaim()'s MADV_DONTNEED then
+        splits nearly all of those huge pages apart again -- 2 MB of
+        AnonHugePages survived out of 6.8 GB -- so that workload pays the
+        cost and keeps none of the benefit. The two features are in tension
+        and the number says by how much. In the suite: peak RSS on the
+        Python churn 1.09x -> 1.12x glibc against a 3.0x limit, and on the
+        byte-pattern stress 0.50x -> 0.68x against a 1.2x limit.
+      - the oracle is the kernel, not the return value. MADV_HUGEPAGE is
+        advice and returns 0 on a kernel with transparent_hugepage=never,
+        so `stress huge` reads AnonHugePages out of
+        /proc/self/smaps_rollup and requires three quarters of the bytes
+        asked for. It skips itself, loudly and counted, when THP is not in
+        madvise mode: with "never" nothing can be backed and with "always"
+        every allocator gets huge pages without asking, so the check would
+        be about the kernel's default rather than about slab. 25 runs, 25
+        passes, no flakiness. glibc fails it.
 - [ ] Return a dead thread's magazines eagerly, not on adoption.
       - why: adoption bounds the stranded memory by peak thread count, not by
         threads created, which is enough for a thread pool and not for a
