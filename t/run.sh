@@ -249,6 +249,26 @@ else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
 fi
 
+# A dead thread's magazines. Adoption bounds what they strand by the PEAK
+# thread count rather than by the number of threads created, which is enough
+# for a pool and not for a program that peaks at many threads and then runs
+# one. `stress sweep` runs 64 threads to a barrier so that 64 distinct
+# magazine sets exist at once, joins them, and then measures malloc_stats()'s
+# magazined figure before and after the main thread allocates enough to make
+# slab want another arena -- the one moment it spends a syscall per live
+# thread looking for dead ones.
+#
+# It also checks where the objects went. `live` in that dump is net of the
+# magazines, so a sweep that emptied the heads without handing the objects
+# back to their spans would make the magazined figure look perfect while the
+# memory was gone for good.
+if LD_PRELOAD="$SLAB" ./t/stress sweep "$T/sweep.txt" >"$T/sw.out" 2>&1; then
+	ok "magazine sweep: $(sed -n 's/^sweep: //p' "$T/sw.out")"
+else
+	bad "magazine sweep: a dead thread's magazines are not coming back"
+	grep '^  FAIL' "$T/sw.out" | head -3 | sed 's/^/        /'
+fi
+
 # Huge pages, with the kernel as the oracle: AnonHugePages in
 # /proc/self/smaps_rollup is the kernel saying how much of the process is
 # really backed by 2 MiB pages. madvise returning 0 says nothing, since
@@ -614,6 +634,15 @@ mutant "a reclaim that leaves the span's first page dirty" "reclaim 200" \
 # candidate here, deleting the live++ in alloc_small, is left out: `frag`
 # catches it, but so does `reclaim`, and the reclaim mutants already own that
 # counter.
+# A dead thread's magazines, both halves: reclaiming them at all, and
+# reclaiming them to somewhere.
+mutant "magazines reclaimed only on adoption" "sweep" \
+	's|\t\tif (tc_sweep() \&\& klass\[cls\].partial)|\t\tif (0 \&\& klass[cls].partial)|' \
+	"$T/msweep.txt"
+mutant "a sweep that drops the magazines instead of returning them" "sweep" \
+	's|\t\t\t\t\tfree_small(h, p);|\t\t\t\t\t(void)h;|' \
+	"$T/msweep.txt"
+
 # Huge pages. The second is the one worth having: a 4 MiB arena contains an
 # aligned 2 MiB block wherever it starts, so a span-aligned arena still gets
 # half of itself backed (12288 KiB against 26624), and the first threshold

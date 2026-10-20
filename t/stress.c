@@ -752,6 +752,163 @@ static void check_frag(const char *path)
 	free(v);
 }
 
+/* ---------------- sweep mode ----------------
+ *
+ * SLAB-SPECIFIC. A thread that exits runs none of slab's code, so whatever
+ * is left on its per-class magazines is stranded. Adoption bounds that by
+ * the PEAK number of threads rather than by the number created, which is
+ * enough for a pool and not for a program that peaks at many threads and
+ * then runs one: those sets are never asked for again.
+ *
+ * The observable is malloc_stats()'s magazined figure, which is exactly the
+ * memory in question, and the measurement is a difference across a dump
+ * taken while all those threads are dead and a dump taken after the main
+ * thread has allocated enough to make slab want another arena -- which is
+ * the only moment slab spends a syscall per live thread looking for dead
+ * ones.
+ *
+ * The threads run CONCURRENTLY on purpose. Run one at a time they are
+ * adopted, one set is reused for all of them, and there is nothing to
+ * sweep; `stress tchurn` already covers that case and this one would be
+ * vacuous without the overlap.
+ */
+#define SWEEP_THREADS 64
+#define SWEEP_FILL     8000u    /* just under slab's 8192-byte drain point */
+
+static pthread_barrier_t sweep_bar;
+
+static void *sweep_worker(void *arg)
+{
+	void *v[SWEEP_FILL / 16 + 1];
+
+	(void)arg;
+	/* Just under a drain's worth in every class, allocated and freed, so
+	 * all of it is sitting on this thread's magazines when it exits.
+	 * Free one more than fits and the magazine drains to the spans
+	 * instead, and there is nothing left to strand. */
+	for (size_t sz = 16; sz <= 8192; sz = sz + (sz < 128 ? 16 : sz / 4)) {
+		size_t k = SWEEP_FILL / sz, i;
+
+		if (!k)
+			k = 1;
+		for (i = 0; i < k; i++) {
+			v[i] = malloc(sz);
+			if (v[i])
+				*(unsigned char *)v[i] = 1;
+		}
+		for (i = 0; i < k; i++)
+			free(v[i]);
+	}
+	/* Nobody exits until everybody has filled, so there are
+	 * SWEEP_THREADS distinct magazine sets rather than one adopted set
+	 * handed around. Without this the check measured 189 KiB stranded
+	 * where it expected megabytes, because threads that had already
+	 * exited were being adopted (and, once this commit existed, swept)
+	 * while the later ones were still starting. */
+	pthread_barrier_wait(&sweep_bar);
+	return NULL;
+}
+
+static int read_mag(const char *path, int nth, size_t *objs, size_t *bytes)
+{
+	FILE *f = fopen(path, "r");
+	char line[8192];
+	int seen = 0;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof line, f)) {
+		size_t a, b, mo, mb;
+		if (sscanf(line, "slab: small live=%zu livebytes=%zu "
+			   "magazined=%zu magbytes=%zu", &a, &b, &mo, &mb) != 4)
+			continue;
+		if (++seen != nth)
+			continue;
+		*objs = mo; *bytes = mb;
+		fclose(f);
+		return 1;
+	}
+	fclose(f);
+	return 0;
+}
+
+static void check_sweep(const char *path)
+{
+	pthread_t th[SWEEP_THREADS];
+	size_t o0, b0, o1, b1;          /* magazined objects and bytes */
+	size_t n0, nb0, ns0, nm0;       /* live, NET of the magazines */
+	size_t n1, nb1, ns1, nm1;
+	int i;
+	enum { NFORCE = 12000 };          /* 1 KiB each: 12 MiB, several arenas */
+	void **v;
+
+	pthread_barrier_init(&sweep_bar, NULL, SWEEP_THREADS + 1);
+	for (i = 0; i < SWEEP_THREADS; i++)
+		if (pthread_create(&th[i], NULL, sweep_worker, NULL) != 0) {
+			CHECK(0, "pthread_create failed at %d", i);
+			return;
+		}
+	pthread_barrier_wait(&sweep_bar);
+	for (i = 0; i < SWEEP_THREADS; i++)
+		pthread_join(th[i], NULL);
+	pthread_barrier_destroy(&sweep_bar);
+
+	dump_stats(path, 0);
+	if (!read_small(path, 1, &n0, &nb0, &ns0, &nm0) ||
+	    !read_mag(path, 1, &o0, &b0)) {
+		CHECK(0, "malloc_stats() produced no 'slab: small' line");
+		return;
+	}
+	CHECK(b0 > 2u * 1024 * 1024,
+	      "%zu dead threads left only %zu KiB on their magazines, which is "
+	      "too little for this check to mean anything",
+	      (size_t)SWEEP_THREADS, b0 / 1024);
+
+	v = malloc(NFORCE * sizeof *v);
+	CHECK(v != NULL, "could not allocate the slot array");
+	if (!v)
+		return;
+	for (i = 0; i < NFORCE; i++) {
+		v[i] = malloc(1024);
+		if (!v[i]) {
+			CHECK(0, "malloc(1024) failed at %d", i);
+			return;
+		}
+		*(unsigned char *)v[i] = 1;
+	}
+	dump_stats(path, 1);
+	if (!read_small(path, 2, &n1, &nb1, &ns1, &nm1) ||
+	    !read_mag(path, 2, &o1, &b1)) {
+		CHECK(0, "the second malloc_stats() dump has no summary line");
+		return;
+	}
+	printf("sweep: %zu dead threads held %zu KiB on their magazines, "
+	       "%zu KiB left after the next arena was wanted\n",
+	       (size_t)SWEEP_THREADS, b0 / 1024, b1 / 1024);
+	/* The main thread's own magazines are in the second figure and cannot
+	 * be subtracted from outside; they are at most 32 classes by the 8 KiB
+	 * drain threshold, so 256 KiB, and a tenth of the starting figure is
+	 * comfortably above that while being far below it. */
+	CHECK(b1 * 10 < b0,
+	      "%zu KiB was still on dead threads' magazines after an arena was "
+	      "wanted, down from %zu KiB: they are only being reclaimed by "
+	      "adoption", b1 / 1024, b0 / 1024);
+	/* And the objects have to arrive somewhere. `live` here is net of the
+	 * magazines, so a sweep that emptied the magazine heads without
+	 * handing the objects back to their spans would leave those %zu
+	 * objects counted live and owned by nobody -- the magazined figure
+	 * above would look perfect and the memory would be gone for good.
+	 * Only NFORCE objects were allocated between the two dumps. */
+	CHECK(n1 - n0 <= (size_t)NFORCE + 1000,
+	      "%zu objects became live between the dumps where only %d were "
+	      "allocated: the sweep is dropping magazines rather than "
+	      "returning them (%zu came off the magazines)",
+	      n1 - n0, NFORCE, o0 - o1);
+	for (i = 0; i < NFORCE; i++)
+		free(v[i]);
+	free(v);
+}
+
 /* ---------------- reclaim mode ----------------
  *
  * Does a transient peak come back down?  Not a slab-specific question: glibc
@@ -1278,6 +1435,8 @@ int main(int argc, char **argv)
 		check_tlb(n ? n : 2000000, 20000000);
 	} else if (!strcmp(mode, "huge")) {
 		check_huge(n ? n : 400000);
+	} else if (!strcmp(mode, "sweep")) {
+		check_sweep(argc > 2 ? argv[2] : "sweep.txt");
 	} else if (!strcmp(mode, "frag")) {
 		check_frag(argc > 2 ? argv[2] : "frag.txt");
 	} else if (!strcmp(mode, "reclaim")) {
@@ -1330,8 +1489,8 @@ int main(int argc, char **argv)
 		return 0;
 	} else {
 		fprintf(stderr,
-			"usage: stress check|guard|reclaim|huge|tlb|frag PATH|"
-			"stress|thread|tchurn|bench [n]\n");
+			"usage: stress check|guard|reclaim|huge|tlb|"
+			"frag PATH|sweep PATH|stress|thread|tchurn|bench [n]\n");
 		return 2;
 	}
 

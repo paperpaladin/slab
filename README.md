@@ -34,7 +34,7 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 63 checks in three tiers, plus a recorded corpus.
+`make test` runs 66 checks in three tiers, plus a recorded corpus.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -86,7 +86,7 @@ against glibc, with the replay required to reproduce the trace exactly
 before any timing from it is believed.
 
 Tier 3: the oracle checked for teeth, by mutation. `make test` builds
-twenty deliberately broken slabs: objects that overlap by 8 bytes, a
+twenty-two deliberately broken slabs: objects that overlap by 8 bytes, a
 `calloc` that never zeroes, a `realloc` that copies half the bytes, a class
 index one too small for one octave, magazines with no adoption, a `realloc`
 that moves a large block instead of growing it, a reserved tail mapped
@@ -98,8 +98,9 @@ span's first page dirty, a displaced spare span reclaimed without checking
 it is still empty, a span that is never relinked when it stops being full, a
 size class widened until one octave wastes a third, a `malloc_stats` that
 does not subtract the magazines, arenas that are never recorded so the dump
-sees no spans, arenas that never ask for huge pages, and arenas aligned to a
-span instead of a huge page. Each must be rejected *by the check that owns that
+sees no spans, arenas that never ask for huge pages, arenas aligned to a
+span instead of a huge page, magazines reclaimed only on adoption, and a
+sweep that drops a dead thread's magazines instead of returning them. Each must be rejected *by the check that owns that
 behaviour*, not merely by some check somewhere. That distinction is
 load-bearing; see below.
 
@@ -122,7 +123,7 @@ to fail.
 ```
 $ make test
 ok    interposition: LD_PRELOAD replaces malloc (usable(malloc(1)) 24 -> 16)
-ok    ls -la /usr/bin (90343 bytes identical)
+ok    ls -la /usr/bin (91690 bytes identical)
 ok    ls -R /usr/include (101762 bytes identical)
 ok    ls error path (5 bytes identical)
 ok    cat /etc/services (12990 bytes identical)
@@ -147,21 +148,22 @@ ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
 ok    peak RSS 1.12x glibc on a churn workload (limit 3.0x)
+ok    magazine sweep: 64 dead threads held 11084 KiB on their magazines, 7 KiB left after the next arena was wanted
 ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
 ok    fragmentation: glibc fails 9 of the per-size bounds, so they are slab's own
-ok    span reclaim: RSS 33084 -> 266556 -> 47016 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
-ok    peak RSS 0.68x glibc on the byte-pattern stress (limit 1.2x)
+ok    span reclaim: RSS 32936 -> 266472 -> 46932 KiB, 204800 KiB requested, 95% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.67x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
-ok    span cache: 200 large cycles cost 2 munmaps (glibc 2)
+ok    span cache: 200 large cycles cost 1 munmaps (glibc 2)
 ok    grow loop: 200 doubling chains cost 16 mmap+munmap (glibc 11)
-ok    trace gcc: 665124 replayable ops, 10251 slots (peak live blocks), 342012 KiB requested
-ok    replay gcc under slab: 1995372 ops in 0.068s = 34.0 ns/op (3 reps, 10251 slots) vs glibc 22.8 ns/op (3 reps, 10251 slots)
+ok    trace gcc: 720660 replayable ops, 10251 slots (peak live blocks), 368303 KiB requested
+ok    replay gcc under slab: 2161980 ops in 0.077s = 35.7 ns/op (3 reps, 10251 slots) vs glibc 22.8 ns/op (3 reps, 10251 slots)
 ok    replay gcc under glibc reproduces it too, so the trace is sound
-ok    trace py: 20090 replayable ops, 6312 slots (peak live blocks), 97209 KiB requested
-ok    replay py under slab: 60270 ops in 0.009s = 151.3 ns/op (3 reps, 6312 slots) vs glibc 264.4 ns/op (3 reps, 6312 slots)
+ok    trace py: 20083 replayable ops, 6305 slots (peak live blocks), 97208 KiB requested
+ok    replay py under slab: 60249 ops in 0.008s = 131.0 ns/op (3 reps, 6305 slots) vs glibc 230.7 ns/op (3 reps, 6305 slots)
 ok    replay py under glibc reproduces it too, so the trace is sound
 ok    self-check: the replay rejects itself when it skips one op in sixteen
 ok    self-check: 'stress stress 200000' rejects objects that overlap by 8 bytes
@@ -176,16 +178,18 @@ ok    self-check: 'stress guard' rejects a shrink that drops the pages but leave
 ok    self-check: 'stress reclaim 200' rejects a wholly free span that is never given back
 ok    self-check: 'stress reclaim 200' rejects a reclaim that re-arms the span without the madvise
 ok    self-check: 'stress reclaim 200' rejects a reclaim that leaves the span's first page dirty
+ok    self-check: 'stress sweep' rejects magazines reclaimed only on adoption
+ok    self-check: 'stress sweep' rejects a sweep that drops the magazines instead of returning them
 ok    self-check: 'stress huge' rejects arenas that never ask for huge pages
 ok    self-check: 'stress huge' rejects arenas aligned to a span instead of a huge page
 ok    self-check: 'stress frag' rejects a class that wastes more than a fifth of its allocation
 ok    self-check: 'stress frag' rejects a dump that does not account for the magazines
 ok    self-check: 'stress frag' rejects arenas that are never recorded, so the dump sees no spans
 ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
-ok    self-check: peak RSS rejects magazines with no adoption (11.24x, limit 1.5x)
-ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.86x, limit 1.2x)
+ok    self-check: peak RSS rejects magazines with no adoption (11.00x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.83x, limit 1.2x)
 
-63 passed, 0 failed, 0 skipped
+66 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -458,6 +462,35 @@ The recorded program touched its memory in some pattern the trace does not
 carry, so page-fault and cache behaviour here is the replay's, not the
 program's. What carries over exactly is the sequence of sizes and the
 lifetimes.
+
+## What a dead thread leaves behind
+
+A thread that exits runs none of slab's code, so whatever is on its per-class
+magazines -- up to 8 KiB a class, 256 KiB in all -- is stranded. Two things
+get it back. A new thread **adopts** a set whose owner's tid no longer exists
+(`tgkill(tid, 0)` returning `ESRCH`), which bounds the loss by the peak
+number of threads rather than by the number created. And when `span_new` is
+about to take another 4 MiB from the kernel, it **sweeps** the registry
+first, which covers the case adoption does not: a program that peaks at many
+threads and then runs one never asks for those sets again.
+
+Per new arena, not per new span: a sweep costs a `tgkill` per live thread,
+which per 4 MiB is nothing and per 64 KiB would be a syscall per seven
+allocations in the 8192 class.
+
+Measured with 64 threads held to a barrier so that 64 distinct magazine sets
+exist at once: **11077 KiB on dead threads' magazines, 7 KiB after** the main
+thread allocated enough to want another arena. The barrier is load-bearing --
+without it the threads overlap unevenly, later ones adopt earlier ones' sets,
+the sweep fires during the run, and the check measured 189 KiB stranded while
+proving almost nothing.
+
+The check also asks where the objects went, because a sweep that emptied the
+magazine heads without handing the objects back to their spans would make the
+figure above look perfect while the memory was gone for good. `live` in the
+dump is net of the magazines, so only the objects the main thread actually
+allocated may become live between the two dumps; the mutant that drops them
+shows 109775 where 12000 were allocated.
 
 ## Huge pages, and a win none of the benchmarks could see
 

@@ -357,15 +357,27 @@ static void *map_aligned(size_t len, int prot, size_t *got)
 	return map_aligned_to(len, prot, got, SPAN_SIZE);
 }
 
-/* shortcut: spans are never unmapped and never returned to the OS, so peak
- * RSS is sticky - a program that allocates 500 MB of 64-byte objects and
- * frees them keeps 500 MB resident.  Ceiling: anything with a large
- * transient peak looks much worse than glibc here.  Upgrade path: track
- * free objects per span, and madvise(MADV_DONTNEED) a span once it is
- * wholly free (the span stays mapped so the AND-mask lookup still works). */
+/* Defined with the magazines further down, and declared here because the
+ * one place worth sweeping from is the one place that maps new memory. */
+static unsigned tc_sweep(void);
+
+/* shortcut: a span's ADDRESS SPACE is never given back.  Its pages are --
+ * see span_reclaim(), which madvises a wholly free span away and gets 94%
+ * of a transient peak back -- but the mapping stays, because the AND-mask
+ * header lookup depends on it, and the arena it was carved from is never
+ * unmapped either.  Ceiling: a program with a large transient peak holds
+ * the address space, not the memory, which on 64-bit is a non-event and on
+ * 32-bit would not be.  Upgrade path: none worth having; see the Non-goals
+ * in PLAN.md. */
 static struct hdr *span_new(unsigned cls)
 {
 	if (arena_cur == arena_end) {
+		/* About to take another 4 MiB from the kernel, which is the
+		 * one moment worth spending a syscall per live thread to ask
+		 * whether a thread that has exited is still holding objects.
+		 * If it gave anything back to this class, use that instead. */
+		if (tc_sweep() && klass[cls].partial)
+			return klass[cls].partial;
 		/*
 		 * Arenas are 2 MiB-aligned and asked for huge pages.  A 4 MiB
 		 * arena is exactly the shape a transparent huge page wants,
@@ -592,13 +604,20 @@ static __thread struct tcache *tc __attribute__((tls_model("initial-exec")));
  * a NULL tc is a complete fallback -- every path below then behaves exactly
  * as it did before magazines existed.
  *
- * Adoption is what keeps a thread-churning program from leaking.  A thread
- * that exits runs no code of ours: pthread_key_create's destructor is the
- * usual answer and is ruled out here, because pthread_setspecific allocates
- * for key indices past the first level and would call straight back into us.
- * So the magazines live in our own memory, the registry outlives every
- * thread, and liveness is a tgkill(tid, 0).  A recycled tid makes that say
- * "alive", which costs one unnecessary carve and is otherwise harmless.
+ * Adoption is half of what keeps a thread-churning program from leaking; the
+ * other half is tc_sweep() below.  A thread that exits runs no code of ours:
+ * pthread_key_create's destructor is the usual answer and is ruled out here,
+ * because pthread_setspecific allocates for key indices past the first level
+ * and would call straight back into us.  So the magazines live in our own
+ * memory, the registry outlives every thread, and liveness is a
+ * tgkill(tid, 0).  A recycled tid makes that say "alive", which costs one
+ * unnecessary carve and is otherwise harmless.
+ *
+ * Adoption alone bounds what is stranded by the PEAK thread count rather
+ * than by the number of threads created, which is enough for a pool and not
+ * for a program that peaks at many threads and then runs one.  tc_sweep()
+ * is what covers that, and a set it has emptied is marked with owner 0 and
+ * taken here without a syscall.
  */
 static struct tcache *tc_claim(void)
 {
@@ -607,6 +626,11 @@ static struct tcache *tc_claim(void)
 	int pid = (int)getpid();
 
 	for (struct tcache *t = tc_all; t; t = t->next) {
+		if (t->owner == 0) {        /* swept by tc_sweep(), and empty */
+			t->owner = me;
+			errno = saved;
+			return t;
+		}
 		if (t->owner == me)
 			continue;
 		if (syscall(SYS_tgkill, pid, t->owner, 0) == 0 || errno != ESRCH)
@@ -636,6 +660,58 @@ static struct tcache *tc_claim(void)
 	tc_all = t;
 	errno = saved;
 	return t;
+}
+
+/*
+ * Give back the magazines of every thread that has exited.
+ *
+ * Adoption (tc_claim above) bounds what a dead thread strands by the peak
+ * number of threads, not by the number created, which is enough for a pool
+ * and not for a program that peaks at 500 threads and then runs one: those
+ * 499 sets are never asked for again and hold up to 256 KiB each.
+ *
+ * Called with the lock held, from span_new() and ONLY when the arena is
+ * exhausted, which is to say only when the alternative is taking another
+ * 4 MiB from the kernel.  That is the rate limit: a tgkill per live thread
+ * per 4 MiB is nothing, where the same sweep on every new span would be a
+ * syscall per seven allocations in the 8192 class.
+ *
+ * A swept set gets owner 0, which tc_claim() reads as "take me".  Nothing
+ * else uses 0: Linux tids start at 1.
+ *
+ * Returns the number of objects handed back, so span_new() knows whether it
+ * is worth looking at the class's partial list again before mapping.
+ */
+static unsigned tc_sweep(void)
+{
+	int saved = errno;
+	int pid = (int)getpid();
+	unsigned got = 0;
+
+	for (struct tcache *t = tc_all; t; t = t->next) {
+		if (t->owner == 0)
+			continue;
+		if (syscall(SYS_tgkill, pid, t->owner, 0) == 0 || errno != ESRCH)
+			continue;        /* alive, or tgkill said something else */
+		for (unsigned cls = 0; cls < NCLASS; cls++) {
+			void *p = t->m[cls].head;
+
+			while (p) {
+				void *next = *(void **)p;
+				struct hdr *h = hdr_of(p);
+
+				if (h)
+					free_small(h, p);
+				p = next;
+				got++;
+			}
+			t->m[cls].head = NULL;
+			t->m[cls].n = 0;
+		}
+		t->owner = 0;
+	}
+	errno = saved;
+	return got;
 }
 
 /*
