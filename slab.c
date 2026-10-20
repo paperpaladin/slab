@@ -81,24 +81,54 @@ static const uint32_t cls_size[NCLASS] = {
 	5120, 6144, 7168, 8192,
 };
 
+/*
+ * The small and large halves of this are mutually exclusive -- cls says which
+ * -- and they are in an anonymous union so that the names stay unqualified
+ * and the struct stays inside HDR.  It has to: the small half grew a
+ * per-span free list and a list link when spans started being returned to
+ * the kernel, and flat it would have been 80 bytes.
+ */
 struct hdr {
 	uint32_t magic;
 	uint16_t cls;        /* class index, or CLS_LARGE */
 	uint16_t cached;     /* large: this mapping may go in the span cache */
-	uint32_t bump;       /* small: offset of next never-used object */
-	uint32_t cap;        /* small: offset one past the last object */
-	void    *map_base;   /* large: what to hand back to munmap */
-	size_t   map_len;    /* large: how much, reserved tail included */
-	size_t   commit;     /* large: bytes of map_len that are readable/writable */
-	size_t   commit0;    /* large: the commit it was mapped with; see big_shrink */
-	size_t   req;        /* large: usable payload bytes */
+	union {
+		struct {                     /* small */
+			uint32_t bump;       /* offset of next never-used object */
+			uint32_t cap;        /* offset one past the last object */
+			uint32_t live;       /* handed out and not yet returned */
+			void *freelist;      /* free objects IN THIS SPAN */
+			struct hdr *next;    /* next span on klass.partial */
+		};
+		struct {                     /* large */
+			void    *map_base;   /* what to hand back to munmap */
+			size_t   map_len;    /* how much, reserved tail included */
+			size_t   commit;     /* bytes of map_len that are RW */
+			size_t   commit0;    /* the commit it was mapped with */
+			size_t   req;        /* usable payload bytes */
+		};
+	};
 };
 _Static_assert(sizeof(struct hdr) <= HDR, "span header must fit in HDR bytes");
 _Static_assert(HDR % 16 == 0, "payload offset must preserve 16-byte alignment");
 
+/*
+ * Per class, the spans that have somewhere to put an object: a free object on
+ * their own list, or room left on their bump pointer.  Allocation only ever
+ * touches the head.
+ *
+ * The free list used to be global to the class and threaded across spans,
+ * which is cheaper by one indirection and makes it impossible to say whether
+ * a span is empty without walking the whole list.  Per-span lists are what
+ * make the madvise() in span_reclaim() a constant-time decision, and they
+ * improve locality on the way.  The invariant everything below depends on is
+ * that a span is on this list if and only if it has a free object or an
+ * unbumped one, which is why alloc_small() unlinks a span the moment it
+ * fills and free_small() relinks it the moment it stops being full.
+ */
 struct klass {
-	void       *freelist;   /* singly linked through the free objects */
-	struct hdr *cur;        /* span we are currently bump-allocating from */
+	struct hdr *partial;
+	struct hdr *spare;      /* one empty span kept back; see free_small */
 };
 
 static struct klass klass[NCLASS];
@@ -249,6 +279,21 @@ static void note(const char *s) { (void)!write(2, s, strlen(s)); }
 
 static size_t round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
+/* Any pointer we ever returned -> the header of the span (or the large
+ * mapping) it came from, in one AND.  A span-aligned pointer can only have
+ * come from the over-aligned large path, whose header sits one span lower;
+ * see alloc_big().  Defined here rather than next to its large-path siblings
+ * because the small free path needs it too: an object's own span is where it
+ * goes back to. */
+static struct hdr *hdr_of(void *p)
+{
+	uintptr_t u = (uintptr_t)p;
+	struct hdr *h = (struct hdr *)((u & SPAN_MASK) ? (u & ~SPAN_MASK)
+						       : u - SPAN_SIZE);
+	return h->magic == MAGIC ? h : NULL;
+}
+
+
 /* mmap `len` (a whole number of pages) at a SPAN_SIZE-aligned address, by
  * over-mapping and trimming.  The two extra munmaps are paid once per arena
  * and once per large allocation, never on the small path. */
@@ -290,7 +335,77 @@ static struct hdr *span_new(unsigned cls)
 	h->cls = (uint16_t)cls;
 	h->bump = HDR;
 	h->cap = HDR + ((SPAN_SIZE - HDR) / sz) * sz;
+	h->live = 0;
+	h->freelist = NULL;
+	h->next = klass[cls].partial;
+	klass[cls].partial = h;
 	return h;
+}
+
+/*
+ * The last object in a span has just come back.  Give the pages to the
+ * kernel and re-arm the span, which is what turns "peak RSS is sticky
+ * forever" into a number that comes back down.
+ *
+ * MADV_DONTNEED and not munmap, because the mapping has to stay: the
+ * AND-mask header lookup is the whole design, and an unmapped span would
+ * make every pointer arithmetic shortcut in this file a segfault waiting for
+ * the address to be reused.  The kernel drops the pages and the next touch
+ * faults in a fresh zero page, which is also what makes the re-arm below
+ * honest.
+ *
+ * The first page cannot go: the header is at offset 0 and madvise is
+ * page-granular.  So 4 KiB of every 64 KiB span stays resident (6.25%), and
+ * the objects that live in that first page are zeroed by hand instead --
+ * without that, re-arming the bump pointer would hand out dirty memory while
+ * telling calloc the span was untouched, which is a disclosure bug and the
+ * targeted calloc check catches it.
+ *
+ * The span keeps its class and stays on the class's partial list.  It is on
+ * that list by the invariant above (it had a free object a moment ago), and
+ * an empty span with bump < cap belongs there, so there is no list surgery
+ * here at all.
+ *
+ * One empty span per class is kept back rather than reclaimed, because
+ * without that the mixed-sizes benchmark lost 23%: a span of the 8192 class
+ * holds seven objects, so a workload drifting across that boundary emptied
+ * and refilled spans constantly, and 520 extra madvise calls over a bench
+ * run cost about 10 ns on every operation in the row.  It is not the syscall
+ * count that hurts, it is that each one flushes TLBs across every CPU the
+ * process has run on and then the pages have to be faulted back in.  See
+ * free_small() for the one-span hysteresis that fixed it.
+ */
+static void span_reclaim(struct hdr *h)
+{
+	madvise((char *)h + PAGE, SPAN_SIZE - PAGE, MADV_DONTNEED);
+	memset((char *)h + HDR, 0, PAGE - HDR);
+	h->bump = HDR;
+	h->freelist = NULL;
+}
+
+/* Put an object back in its own span.  Called with the lock held. */
+static void free_small(struct hdr *h, void *p)
+{
+	int wasfull = !h->freelist && h->bump == h->cap;
+
+	*(void **)p = h->freelist;
+	h->freelist = p;
+	if (wasfull) {
+		h->next = klass[h->cls].partial;
+		klass[h->cls].partial = h;
+	}
+	if (--h->live == 0) {
+		/* Keep the most recently emptied span of this class back, and
+		 * reclaim whichever one it displaces -- but only if that one is
+		 * still empty, since it stayed on the partial list and may have
+		 * been handed out again in the meantime. */
+		struct klass *k = &klass[h->cls];
+		struct hdr *old = k->spare;
+
+		k->spare = h;
+		if (old && old != h && old->live == 0)
+			span_reclaim(old);
+	}
 }
 
 /* Pop the class's free list; failing that, bump-allocate the next never-used
@@ -303,22 +418,30 @@ static struct hdr *span_new(unsigned cls)
 static void *alloc_small(unsigned cls, int *fresh)
 {
 	struct klass *k = &klass[cls];
-	void *p = k->freelist;
-	if (p) {
-		k->freelist = *(void **)p;
-		*fresh = 0;
-		return p;
-	}
-	struct hdr *h = k->cur;
-	if (!h || h->bump == h->cap) {
-		h = span_new(cls);
+	struct hdr *h = k->partial;
+	void *p;
+
+	if (!h) {
+		h = span_new(cls);      /* links itself onto k->partial */
 		if (!h)
 			return NULL;
-		k->cur = h;
 	}
-	p = (char *)h + h->bump;
-	h->bump += cls_size[cls];
-	*fresh = 1;
+	if (h->freelist) {
+		p = h->freelist;
+		h->freelist = *(void **)p;
+		*fresh = 0;
+	} else {
+		p = (char *)h + h->bump;
+		h->bump += cls_size[cls];
+		*fresh = 1;
+	}
+	h->live++;
+	if (!h->freelist && h->bump == h->cap) {
+		/* Full, so off the list it goes, which is what lets free_small()
+		 * decide whether to relink by looking at the span alone. */
+		k->partial = h->next;
+		h->next = NULL;
+	}
 	return p;
 }
 
@@ -447,13 +570,16 @@ static struct tcache *tc_claim(void)
 static void mag_drain(unsigned cls)
 {
 	struct mag *m = &tc->m[cls];
-	void *tail = m->head;
+	void *p = m->head;
 
-	for (uint32_t i = 1; i < m->n; i++)
-		tail = *(void **)tail;
 	lock();
-	*(void **)tail = klass[cls].freelist;
-	klass[cls].freelist = m->head;
+	while (p) {
+		void *next = *(void **)p;
+		struct hdr *h = hdr_of(p);
+		if (h)
+			free_small(h, p);
+		p = next;
+	}
 	unlock();
 	m->head = NULL;
 	m->n = 0;
@@ -469,23 +595,34 @@ static void *mag_refill(unsigned cls, int *fresh)
 {
 	struct mag *m = &tc->m[cls];
 	uint32_t want = (MAG_BYTES / 2) / cls_size[cls];
-	void *first = klass[cls].freelist, *last;
-	uint32_t got = 1;
+	void *first = alloc_small(cls, fresh);
 
 	if (!first)
-		return alloc_small(cls, fresh);
-	if (!want)
-		want = 1;
-	last = first;
-	while (got < want && *(void **)last) {
-		last = *(void **)last;
-		got++;
+		return NULL;
+	/* Only RECYCLED objects are stocked, which is why this stops at a span
+	 * with nothing on its free list rather than bump-allocating into the
+	 * magazine: a never-used object has to be handed back directly so that
+	 * calloc can still tell it is untouched zero page.
+	 *
+	 * The batch used to be a splice off one global list, which was fewer
+	 * instructions.  With per-span free lists it is a loop over
+	 * alloc_small(), which keeps the span bookkeeping -- the live count,
+	 * the partial-list invariant -- in exactly one place.  Both walk the
+	 * same number of nodes. */
+	while (m->n + 1 < want) {
+		struct hdr *h = klass[cls].partial;
+		int f;
+		void *p;
+
+		if (!h || !h->freelist)
+			break;
+		p = alloc_small(cls, &f);
+		if (!p)
+			break;
+		*(void **)p = m->head;
+		m->head = p;
+		m->n++;
 	}
-	klass[cls].freelist = *(void **)last;
-	*(void **)last = NULL;
-	m->head = *(void **)first;   /* NULL when got == 1, since last == first */
-	m->n = got - 1;
-	*fresh = 0;
 	return first;
 }
 
@@ -722,14 +859,6 @@ static void big_shrink(struct hdr *h)
 		h->commit = h->commit0;
 }
 
-static struct hdr *hdr_of(void *p)
-{
-	uintptr_t u = (uintptr_t)p;
-	struct hdr *h = (struct hdr *)((u & SPAN_MASK) ? (u & ~SPAN_MASK)
-						       : u - SPAN_SIZE);
-	return h->magic == MAGIC ? h : NULL;
-}
-
 static size_t usable(struct hdr *h)
 {
 	return h->cls == CLS_LARGE ? h->req : cls_size[h->cls];
@@ -805,8 +934,7 @@ void free(void *p)
 	/* The freed object is itself the free-list node: the smallest class is
 	 * 16 bytes, so there is always room for the next pointer in the first 8
 	 * bytes of dead memory, and the list costs no metadata at all. */
-	*(void **)p = klass[h->cls].freelist;
-	klass[h->cls].freelist = p;
+	free_small(h, p);
 	unlock();
 }
 

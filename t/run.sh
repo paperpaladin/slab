@@ -249,6 +249,42 @@ else
 	bad "peak RSS ${rss}x glibc, over the 3.0x limit"
 fi
 
+# Does a transient peak come back down?  A span whose last object has been
+# returned is madvise(MADV_DONTNEED)'d, and `stress reclaim` measures that
+# from inside the process, reading /proc/self/statm before the allocation, at
+# the peak, and after everything is freed.  It also requires a calloc out of a
+# re-armed span to be zero, which is the disclosure half: the first page of a
+# span cannot be given back (the header is in it) and has to be zeroed by
+# hand instead.
+#
+# glibc's number is printed beside it for information and NOT asserted. It is
+# 0% here, and so are jemalloc 5 and tcmalloc: none of them returns a run of
+# freed small objects at the moment it is freed. glibc does it on
+# malloc_trim(0) (264992 -> 30940 KiB measured) and jemalloc with
+# dirty_decay_ms:0 (274580 -> 40532), so this is a difference in when, not in
+# whether, and a future libc could change it. Asserting that glibc fails
+# would be asserting somebody else's policy.
+if LD_PRELOAD="$SLAB" ./t/stress reclaim 200 >"$T/rc.out" 2>&1; then
+	./t/stress reclaim 200 >"$T/rcg.out" 2>&1
+	ok "span reclaim: $(sed -n 's/^reclaim: //p' "$T/rc.out") (glibc: $(sed -n 's/.*requested, //p' "$T/rcg.out"))"
+else
+	bad "span reclaim: freed spans were not given back, or a re-armed span handed out dirty memory"
+	grep '^  FAIL' "$T/rc.out" | head -3 | sed 's/^/        /'
+fi
+
+# Peak RSS of the byte-pattern stress run, which is a different question from
+# the churn ratio above.  This workload fills spans and then frees back into
+# them, which is where a span unlinked from its class when it fills and never
+# relinked when it stops being full leaks every span it has ever used.  slab
+# measures 0.50x glibc and that mutant measures 1.63x; the Python churn
+# workload above cannot tell them apart (1.09x either way).
+sr=$(rss_ratio "$SLAB" ./t/stress stress 3000000)
+if python3 -c "import sys; sys.exit(0 if float('$sr') < 1.2 else 1)"; then
+	ok "peak RSS ${sr}x glibc on the byte-pattern stress (limit 1.2x)"
+else
+	bad "peak RSS ${sr}x glibc on the byte-pattern stress - spans leaking?"
+fi
+
 # Thread churn.  Magazines belong to a thread, and a thread that exits runs
 # none of our code, so every object still on its magazines becomes
 # unreachable unless something reclaims them.  A thousand threads created and
@@ -409,24 +445,70 @@ mutant "a grown block that keeps its grown size when freed" "guard" \
 mutant "a shrink that drops the pages but leaves the tail writable" "guard" \
 	's|\tif (mprotect(from, n, PROT_NONE) == 0)|\tif (1)|'
 
-# The two RSS limits are measurements rather than exit statuses, so `mutant`
-# cannot drive them: an allocator that leaks a megabyte per dead thread still
-# exits 0.  Build the no-adoption slab by hand and require the thread-churn
-# limit to throw it out.
-sed 's|if (syscall(SYS_tgkill, pid, t->owner, 0) == 0 |if (1 |' slab.c >"$T/na.c"
-if cmp -s "$T/na.c" slab.c; then
-	bad "self-check no-adoption: sed did not apply (slab.c changed shape)"
-elif ! gcc $MUT -o "$T/na.so" "$T/na.c" 2>"$T/m.err"; then
-	bad "self-check no-adoption: mutant did not compile"
-	head -2 "$T/m.err" | sed 's/^/        /'
-else
-	nar=$(rss_ratio "$T/na.so" ./t/stress tchurn 1000)
-	if python3 -c "import sys; sys.exit(0 if float('$nar') >= 1.5 else 1)"; then
-		ok "self-check: thread-churn RSS rejects magazines with no adoption (${nar}x)"
-	else
-		bad "self-check: no-adoption magazines measured only ${nar}x, limit has no teeth"
+# Span reclamation.  The fourth is the one that matters most: a span
+# madvise()d while objects in it are still live is silent corruption, and it
+# is the byte-pattern churn rather than any RSS number that catches it, at
+# iteration 43181 of 200000 with eight blocks clobbered.
+#
+# Two things here cannot be mutation-tested, and saying so is better than
+# pretending otherwise. Removing the one-span hysteresis in free_small() is a
+# 23% slowdown on one benchmark row and nothing else, and removing the
+# RESERVE_MIN floor above is a 4x slowdown on another; the suite asserts no
+# timings, so both survive it. The numbers are in the README instead.
+mutant "a wholly free span that is never given back" "reclaim 200" \
+	's|\tif (--h->live == 0) {|\tif (0) {|'
+mutant "a reclaim that re-arms the span without the madvise" "reclaim 200" \
+	's|\tmadvise((char \*)h + PAGE, SPAN_SIZE - PAGE, MADV_DONTNEED);|\t(void)0;|'
+mutant "a reclaim that leaves the span's first page dirty" "reclaim 200" \
+	's|\tmemset((char \*)h + HDR, 0, PAGE - HDR);|\t(void)0;|'
+mutant "a displaced spare reclaimed without checking it is still empty" "stress 200000" \
+	's@\t\tif (old \&\& old != h \&\& old->live == 0)@\t\tif (old \&\& old != h)@'
+
+# Some limits here are measurements rather than exit statuses, so `mutant`
+# cannot drive them: an allocator that leaks a megabyte per dead thread, or a
+# span per filled span, still exits 0.  Same guards as `mutant` -- sed's
+# status, and the mutant has to actually interpose -- then require the peak
+# RSS under it to be at least LIMIT times glibc's.
+rss_mutant() {
+	_name=$1
+	_limit=$2
+	_expr=$3
+	shift 3
+	if ! sed "$_expr" slab.c >"$T/rm.c"; then
+		bad "self-check $_name: sed failed (delimiter clash?)"
+		return
 	fi
-fi
+	if cmp -s "$T/rm.c" slab.c; then
+		bad "self-check $_name: sed did not apply (slab.c changed shape)"
+		return
+	fi
+	if ! gcc $MUT -o "$T/rm.so" "$T/rm.c" 2>"$T/m.err"; then
+		bad "self-check $_name: mutant did not compile"
+		head -2 "$T/m.err" | sed 's/^/        /'
+		return
+	fi
+	_mu=$(LD_PRELOAD="$T/rm.so" ./t/stress interposed 2>/dev/null)
+	if [ -z "$_mu" ] || [ "$_mu" = "$g_usable" ]; then
+		bad "self-check $_name: the mutant does not interpose malloc (usable=$_mu, glibc=$g_usable), so rejecting it proves nothing"
+		return
+	fi
+	_r=$(rss_ratio "$T/rm.so" "$@")
+	if python3 -c "import sys; sys.exit(0 if float('$_r') >= $_limit else 1)"; then
+		ok "self-check: peak RSS rejects $_name (${_r}x, limit ${_limit}x)"
+	else
+		bad "self-check: $_name measured only ${_r}x glibc, the ${_limit}x limit has no teeth"
+	fi
+}
+
+rss_mutant "magazines with no adoption" 1.5 \
+	's|if (syscall(SYS_tgkill, pid, t->owner, 0) == 0 |if (1 |' \
+	./t/stress tchurn 1000
+# Caught by nothing else: it corrupts no memory and exits 0.  The reclaim
+# check passes under it, the Python churn ratio passes under it, and the
+# byte-pattern stress passes under it -- only its footprint gives it away.
+rss_mutant "a span that is never relinked when it stops being full" 1.2 \
+	's|\tif (wasfull) {|\tif (0) {|' \
+	./t/stress stress 3000000
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

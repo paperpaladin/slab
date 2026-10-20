@@ -26,7 +26,7 @@ object. That is the footprint benchmark slab wins, and it wins it by 39%.
 
 ## The oracle
 
-`make test` runs 40 checks in three tiers.
+`make test` runs 47 checks in three tiers.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -51,6 +51,16 @@ threads with blocks handed between them so cross-thread `free` is exercised.
 The stress and semantic tests also run against glibc `malloc`, because if
 they fail there then the test is wrong, not slab.
 
+Two tier-2 checks are measurements rather than assertions about output.
+`t/stress reclaim` allocates 200 MB of 56-byte objects, dirties every byte,
+frees all of it, and reads resident size out of `/proc/self/statm` before,
+at the peak and after. slab gives back 94% of the peak. It also requires
+20 000 `calloc`s out of the re-armed spans to come back zero, which is the
+disclosure half of returning memory: the first page of a span cannot be
+given back, because the header is in it. And peak RSS of the byte-pattern
+stress run is held under 1.2x glibc, which is the only check that notices a
+span leaking.
+
 One tier-2 check is slab-specific and says so: `t/stress guard` asserts that
 `realloc` grows a large block *without moving it* (the same pointer comes
 back), that the kernel reports the reserved tail as `---p` in
@@ -60,16 +70,25 @@ size when freed. glibc fails all eight of its assertions, and the suite
 asserts that too, because a guard assertion glibc also satisfied would be
 testing the C library rather than the reservation.
 
-Tier 3: the oracle checked for teeth, by mutation. `make test` builds ten
-deliberately broken slabs, objects that overlap by 8 bytes, a `calloc` that
-never zeroes, a `realloc` that copies half the bytes, a class index one too
-small for one octave, magazines with no adoption, a `realloc` that moves a
-large block instead of growing it, a reserved tail mapped writable instead
-of `PROT_NONE`, a reservation that is never taken, a grown block that keeps
-its grown size when freed, and a shrink that drops the pages but leaves the
-tail writable. Each must be rejected *by the check that owns that
-behaviour*, not merely by some check somewhere. That distinction is
-load-bearing; see below.
+Tier 3: the oracle checked for teeth, by mutation. `make test` builds
+fifteen deliberately broken slabs: objects that overlap by 8 bytes, a
+`calloc` that never zeroes, a `realloc` that copies half the bytes, a class
+index one too small for one octave, magazines with no adoption, a `realloc`
+that moves a large block instead of growing it, a reserved tail mapped
+writable instead of `PROT_NONE`, a reservation that is never taken, a grown
+block that keeps its grown size when freed, a shrink that drops the pages
+but leaves the tail writable, a wholly free span that is never given back, a
+reclaim that re-arms a span without the `madvise`, a reclaim that leaves the
+span's first page dirty, a displaced spare span reclaimed without checking
+it is still empty, and a span that is never relinked when it stops being
+full. Each must be rejected *by the check that owns that behaviour*, not
+merely by some check somewhere. That distinction is load-bearing; see below.
+
+Two things in `slab.c` cannot be mutation-tested and the README says so
+rather than leaving the impression that everything is covered: removing the
+one-span hysteresis in `free_small` and removing the `RESERVE_MIN` floor are
+both pure slowdowns, 23% and 4x on one benchmark row each, and the suite
+asserts no timings.
 
 The mutation harness needed hardening to be worth anything, and the bug was
 found by being fooled by it. `|` is both sed's delimiter and a C operator,
@@ -109,6 +128,8 @@ ok    stress: 3M random ops, byte pattern verified
 ok    stress: 4 threads, 400k ops each, cross-thread free
 ok    oracle agrees with glibc malloc
 ok    peak RSS 1.09x glibc on a churn workload (limit 3.0x)
+ok    span reclaim: RSS 31028 -> 265316 -> 45776 KiB, 204800 KiB requested, 94% of the peak given back (glibc: 0% of the peak given back)
+ok    peak RSS 0.50x glibc on the byte-pattern stress (limit 1.2x)
 ok    stress: 1000 sequential threads, nothing live at the end
 ok    peak RSS 1.00x glibc after 1000 dead threads (limit 1.5x)
 ok    span cache: 200 large cycles cost 3 munmaps (glibc 2)
@@ -122,9 +143,14 @@ ok    self-check: 'stress guard' rejects a reserved tail that is mapped writable
 ok    self-check: 'stress guard' rejects a reservation that is never taken
 ok    self-check: 'stress guard' rejects a grown block that keeps its grown size when freed
 ok    self-check: 'stress guard' rejects a shrink that drops the pages but leaves the tail writable
-ok    self-check: thread-churn RSS rejects magazines with no adoption (10.46x)
+ok    self-check: 'stress reclaim 200' rejects a wholly free span that is never given back
+ok    self-check: 'stress reclaim 200' rejects a reclaim that re-arms the span without the madvise
+ok    self-check: 'stress reclaim 200' rejects a reclaim that leaves the span's first page dirty
+ok    self-check: 'stress stress 200000' rejects a displaced spare reclaimed without checking it is still empty
+ok    self-check: peak RSS rejects magazines with no adoption (10.56x, limit 1.5x)
+ok    self-check: peak RSS rejects a span that is never relinked when it stops being full (1.64x, limit 1.2x)
 
-40 passed, 0 failed, 0 skipped
+47 passed, 0 failed, 0 skipped
 ```
 
 `malloc_usable_size` is the cheapest observable that separates them,
@@ -149,31 +175,29 @@ same binary on the same machine in the same sitting.
 
 ```
                         glibc              jemalloc             tcmalloc              slab
-small-churn        13.7 [ 13.5-  16.3]  10.1 [  9.8-  10.3]   8.9 [  8.4-  12.4]   16.0 [  13.3-  18.7]
-mixed-sizes        36.9 [ 36.1-  48.6]  24.3 [ 23.5-  25.8]  18.2 [ 17.8-  25.3]   48.5 [  44.2-  62.0]
-realloc-grow       49.2 [ 48.1-  61.5] 131.0 [123.0- 174.0] 106.8 [101.3- 132.6]  151.1 [ 146.2- 159.7]
-large-grow          877 [  775-  1287] 14554 [13416- 15153] 16250 [15186- 18613]   2274 [  2165-  2447]
-large-churn         475 [  441-   668]   419 [  380-   604]   231 [  211-   255]   2325 [  2223-  2446]
-4-thread-churn      3.9 [  3.5-   5.3]   4.0 [  2.7-   5.8]   2.6 [  2.3-   3.8]    4.9 [   3.5-   5.9]
+small-churn        13.5 [ 12.9-  14.5]  10.0 [  9.7-  14.9]   9.1 [  8.3-  10.5]   13.1 [  12.4-  13.5]
+mixed-sizes        35.8 [ 34.0-  41.1]  24.5 [ 22.8-  29.1]  18.2 [ 17.5-  19.7]   46.7 [  45.0-  59.2]
+realloc-grow       50.0 [ 46.1-  69.3] 128.6 [121.2- 158.3] 102.4 [ 97.2- 117.9]  149.9 [ 139.6- 169.3]
+large-grow          807 [  798-   957] 13911 [12506- 18829] 15750 [14760- 16858]   2398 [  2223-  3103]
+large-churn         498 [  475-   554]   412 [  378-   592]   237 [  213-   297]   2353 [  2215-  3006]
+4-thread-churn      4.1 [  3.6-   5.5]   3.0 [  2.6-   4.9]   3.4 [  2.4-   5.0]    4.7 [   3.3-   5.6]
 ```
 
-slab loses every row to glibc: 1.2x on small churn, 1.3x on mixed sizes,
-3.1x on short realloc chains, 2.6x on large-grow, 4.9x on large-block churn
-and 1.3x on four threads. Against jemalloc and tcmalloc it loses five of six
-and the worst of those is large-block churn again, 5.5x and 10x. Those are
-the standings and nothing here argues them away; a 900-line allocator with
-one global lock and a 16-entry mapping cache is not going to beat three
-mature ones.
+Against glibc, slab loses four rows and takes two: 1.30x on mixed sizes,
+3.00x on short realloc chains, 2.97x on large-grow and 4.72x on large-block
+churn, against 0.97x on small churn (its whole spread sits below glibc's
+median) and 1.15x on four threads, which is inside the spread. Against
+jemalloc and tcmalloc it loses five of six, and the worst of those is
+large-block churn again, 5.7x and 9.9x. Those are the standings and nothing
+here argues them away; a 1000-line allocator with one global lock and a
+16-entry mapping cache is not going to beat three mature ones.
 
-The exception is `large-grow`, a buffer grown from 16 KiB to 4 MiB by
-doubling, where slab is 6.4x FASTER than jemalloc and 7.1x faster than
-tcmalloc, and within 2.6x of glibc rather than the 216x it was before this
-commit. The reason is the reserved tail described next. Measured against the
-previous commit in one interleaved run of ten repetitions each, that row
-went from 207606 ns/op to 2818, a factor of 74, while the other five moved
-by 1.01x to 1.06x -- and the 1.06x, on large-block churn, is repeatable
-across two such runs and is the price of one extra `mprotect` per large
-allocation.
+The row it takes outright is `large-grow`, a buffer grown from 16 KiB to
+4 MiB by doubling, where slab is 5.8x FASTER than jemalloc and 6.6x faster
+than tcmalloc. It is also the row that moved: 216x glibc before the reserved
+tail described below, and 2.97x after. Measured against the commit before it
+in one interleaved run of ten repetitions each, 207606 ns/op to 2818, a
+factor of 74, while the other five moved by 1.01x to 1.06x.
 
 ### Growing a large block without copying
 
@@ -225,6 +249,71 @@ doublings. Pushed past the span cache's reach the picture is noisier, and
 these are the measurements rather than an argument: a chain to 16 MiB
 improves 1.3x over the previous commit and a chain to 64 MiB improves 19x.
 
+### Giving a transient peak back
+
+Spans used to be mapped once and kept forever, so a program that allocated
+500 MB of small objects and freed them stayed at 500 MB. A span whose last
+object has been returned is now `madvise(MADV_DONTNEED)`'d. The mapping
+stays, because the AND-mask header lookup depends on it; the pages go, and
+the next touch faults in a fresh zero page.
+
+Measured from inside the process, resident size read out of
+`/proc/self/statm` before allocating 200 MB of 56-byte objects, at the peak,
+and after freeing all of them (56 and not 64 so that glibc's 64-byte chunk
+and slab's 64-byte class carry the same per-object overhead and the
+comparison is about reclaiming rather than headers):
+
+```
+slab                     31004 -> 265292 -> 45692 KiB     94% given back
+glibc                    30932 -> 264988 -> 264988 KiB      0%
+jemalloc 5               32196 -> 274520 -> 274524 KiB      0%
+tcmalloc_minimal         36712 -> 272204 -> 272204 KiB      0%
+
+glibc, then malloc_trim(0)           264992 -> 30940 KiB
+jemalloc, dirty_decay_ms:0           274580 -> 40532 KiB
+jemalloc, then sleep(16)             274568 -> 274636 KiB
+```
+
+The difference is when, not whether. glibc hands it back the moment you ask
+with `malloc_trim(0)`, and jemalloc does it on its decay schedule, which
+with the default `dirty_decay_ms` and no background thread is driven by
+allocator activity rather than by a clock -- hence the sixteen seconds of
+sleeping that changed nothing. slab does it on the free, with nothing to
+configure, which is why its own `malloc_trim` is still a no-op that returns
+0.
+
+It is not free of consequences and two of them are worth stating. 6.25% of
+every span stays resident: `madvise` is page-granular and the span header is
+at offset 0, so the first page cannot go, and the objects living in it are
+zeroed by hand instead -- without that, re-arming the bump pointer would
+hand out dirty memory while telling `calloc` the span was untouched zero
+page. And one empty span per class is kept back rather than reclaimed,
+because without that the `mixed-sizes` row lost 23%: a span of the 8192
+class holds seven objects, so a drifting workload emptied and refilled spans
+constantly, and 520 extra `madvise` calls over a benchmark run cost about
+10 ns on every operation in that row. The syscall count is not the problem;
+each one flushes TLBs across every CPU the process has touched and then the
+pages have to be faulted back in. Keeping one span back took the `madvise`
+count from 624 to 125 and the row back to where it was.
+
+Knowing a span is wholly free needed the small path rewritten. With one free
+list per class threaded across every span, finding out means walking the
+whole list, so each span now owns its free list and a live count and each
+class keeps a list of the spans with room. That change alone, measured with
+the `madvise` disabled, is 0.96x to 1.03x on the six rows, and the whole
+commit is 0.94x to 1.02x.
+
+### The leak that only a footprint number could see
+
+A span is unlinked from its class when it fills. A version that never
+relinked it when an object came back would leak every span it had ever used
+-- and corrupt nothing, exit 0, pass the reclaim check above, and pass the
+existing Python churn RSS ratio at 1.09x, which is exactly what the correct
+code measures. The check that separates them is peak RSS of the byte-pattern
+stress run: 0.51x glibc for the real thing against 1.67x for that mutant.
+It is in the suite now, with that mutant driving it, and it was added
+because the mutant survived everything else.
+
 ### The bug the reservation introduced
 
 A grown mapping has to go back to its natural size when it is freed, and the
@@ -258,9 +347,9 @@ What did run:
 - **UBSan against slab.** `libslab.so` built with `-fsanitize=undefined
   -fno-sanitize-recover=all` and preloaded behind `libubsan.so`, which does
   not replace `malloc`. `interposed` prints 16, so slab is serving. Clean on
-  `check`, `guard`, `stress 500000`, `thread 100000` and `tchurn 200`, and
-  clean under `ls -la /usr/bin`, `sort /etc/services`, a CPython JSON
-  workload and `gcc -O2 -S`.
+  all seven modes -- `check`, `guard`, `reclaim 200`, `stress 500000`,
+  `thread 100000`, `tchurn 200` -- and clean under `ls -la /usr/bin`,
+  `sort /etc/services`, a CPython JSON workload and `gcc -O2 -S`.
 - **ASan and UBSan against the oracle.** `t/stress` built with
   `-fsanitize=address,undefined` and run against the system allocator, which
   is what ASan can see. Clean on `stress`, `thread` and `tchurn`. `check`
@@ -270,7 +359,12 @@ What did run:
   all: it deliberately writes one byte past the end of a block, and ASan
   reports that write as a heap-buffer-overflow and aborts, which is
   independent confirmation that the byte `guard` expects to fault on really
-  is out of bounds.
+  is out of bounds. `reclaim` fails there, because ASan's allocator returns
+  nothing either -- and that run earned its keep: ASan's quarantine grows
+  while the frees happen, so resident size ended ABOVE the peak reading and
+  the "percentage given back" line underflowed to 18446744073709551608%.
+  That was a bug in the oracle, found by running the oracle somewhere it was
+  not expected to pass.
 
 ## License
 
