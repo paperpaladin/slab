@@ -39,6 +39,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <sys/auxv.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stddef.h>
@@ -48,13 +49,40 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-/* shortcut: the page size is a compile-time 4096 rather than
- * sysconf(_SC_PAGESIZE).  Ceiling: wrong on a 16 KiB- or 64 KiB-page kernel
- * (arm64 can be either), where the trailing munmap() in map_aligned() would
- * be rejected for a non-page-aligned length and large allocations would
- * leak address space.  Upgrade path: read AT_PAGESZ out of the auxiliary
- * vector, which is readable without allocating, unlike sysconf. */
-#define PAGE       4096u
+/*
+ * The page size, from the kernel, via AT_PAGESZ in the auxiliary vector.
+ *
+ * It was a compile-time 4096, which is simply wrong on a 16 KiB- or
+ * 64 KiB-page arm64 kernel: the trailing munmap in map_aligned would be
+ * rejected for a non-page-aligned length and large allocations would leak
+ * address space.
+ *
+ * getauxval and not sysconf, because sysconf is allowed to allocate and
+ * this is reached from inside malloc.  Read lazily on first use rather than
+ * in the constructor, so that there is no window in which an allocation is
+ * rounded with one value and freed with another -- the constructor runs
+ * after the dynamic linker has already allocated through us.  Two threads
+ * racing here both compute the same number and store it, which is why there
+ * is no lock.
+ *
+ * The fallback is 4096 for a value that is missing or not a power of two,
+ * rather than a refusal: an allocator that will not start is worse than one
+ * that is wrong in the way it was wrong before.
+ */
+static size_t pagesz;
+
+static size_t page(void)
+{
+	size_t p = pagesz;
+
+	if (!p) {
+		p = (size_t)getauxval(AT_PAGESZ);
+		if (p < 4096 || (p & (p - 1)))
+			p = 4096;
+		pagesz = p;
+	}
+	return p;
+}
 #define SPAN_SIZE  (64u * 1024u)
 #define SPAN_MASK  ((uintptr_t)(SPAN_SIZE - 1))
 #define HDR        64u              /* span header; also the payload offset */
@@ -261,7 +289,7 @@ static size_t reserve_tail(size_t commit)
 		return 0;
 	tail = commit <= RESERVE_MAX / RESERVE_K ? commit * RESERVE_K
 						 : RESERVE_MAX;
-	if (commit > SIZE_MAX - tail - SPAN_SIZE - PAGE)
+	if (commit > SIZE_MAX - tail - SPAN_SIZE - page())
 		return 0;
 	return tail;
 }
@@ -471,8 +499,10 @@ static struct hdr *span_new(unsigned cls)
  */
 static void span_reclaim(struct hdr *h)
 {
-	madvise((char *)h + PAGE, SPAN_SIZE - PAGE, MADV_DONTNEED);
-	memset((char *)h + HDR, 0, PAGE - HDR);
+	if (page() < SPAN_SIZE)
+		madvise((char *)h + page(), SPAN_SIZE - page(),
+			MADV_DONTNEED);
+	memset((char *)h + HDR, 0, page() - HDR);
 	h->bump = HDR;
 	h->freelist = NULL;
 }
@@ -899,7 +929,7 @@ static void *alloc_big(size_t size, size_t align, int *fresh)
 	*fresh = 1;
 
 	if (align >= SPAN_SIZE) {
-		len = round_up(align + SPAN_SIZE + size, PAGE);
+		len = round_up(align + SPAN_SIZE + size, page());
 		base = mmap(NULL, len, PROT_READ | PROT_WRITE,
 			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (base == MAP_FAILED)
@@ -918,7 +948,7 @@ static void *alloc_big(size_t size, size_t align, int *fresh)
 	}
 
 	off = align > HDR ? align : HDR;        /* align is a power of two */
-	size_t commit = round_up(off + size, PAGE);
+	size_t commit = round_up(off + size, page());
 	size_t cached_commit, cached_len;
 	len = commit;
 	base = spancache_take(commit, &cached_commit, &cached_len);
@@ -982,9 +1012,9 @@ static int big_grow(struct hdr *h, void *p, size_t size)
 	size_t off = (size_t)((char *)p - (char *)h->map_base);
 	size_t want;
 
-	if (size > SIZE_MAX - off - PAGE)
+	if (size > SIZE_MAX - off - page())
 		return 0;
-	want = round_up(off + size, PAGE);
+	want = round_up(off + size, page());
 	if (want <= h->commit || want > h->map_len)
 		return 0;
 	if (mprotect((char *)h->map_base + h->commit, want - h->commit,
@@ -1078,7 +1108,7 @@ void *malloc(size_t size)
 	if (size == 0)
 		size = 1;             /* a unique freeable pointer, as is customary */
 	if (size > MAXSMALL) {
-		if (size > SIZE_MAX - SPAN_SIZE - PAGE) { errno = ENOMEM; return NULL; }
+		if (size > SIZE_MAX - SPAN_SIZE - page()) { errno = ENOMEM; return NULL; }
 		lock();
 		p = alloc_big(size, 16, &fresh);
 		unlock();
@@ -1153,7 +1183,7 @@ void *calloc(size_t n, size_t m)
 	int fresh;
 
 	if (size > MAXSMALL) {
-		if (size > SIZE_MAX - SPAN_SIZE - PAGE) { errno = ENOMEM; return NULL; }
+		if (size > SIZE_MAX - SPAN_SIZE - page()) { errno = ENOMEM; return NULL; }
 		lock();
 		p = alloc_big(size, 16, &fresh);
 		unlock();
@@ -1242,7 +1272,7 @@ int posix_memalign(void **out, size_t align, size_t size)
 		p = alloc_small(cls_of(size), &fresh);
 		unlock();
 	} else {
-		if (size > SIZE_MAX - align - SPAN_SIZE - PAGE)
+		if (size > SIZE_MAX - align - SPAN_SIZE - page())
 			return ENOMEM;
 		int fresh;
 		lock();
@@ -1265,9 +1295,12 @@ void *aligned_alloc(size_t align, size_t size)
 
 void *memalign(size_t align, size_t size) { return aligned_alloc(align, size); }
 
-void *valloc(size_t size) { return aligned_alloc(PAGE, size); }
+void *valloc(size_t size) { return aligned_alloc(page(), size); }
 
-void *pvalloc(size_t size) { return aligned_alloc(PAGE, round_up(size ? size : 1, PAGE)); }
+void *pvalloc(size_t size)
+{
+	return aligned_alloc(page(), round_up(size ? size : 1, page()));
+}
 
 void *reallocarray(void *p, size_t n, size_t m)
 {
@@ -1445,6 +1478,17 @@ void malloc_stats(void)
 	p = d_num(p, narena);
 	p = d_str(p, " incomplete=");
 	p = d_num(p, arena_overflow);
+	p = d_str(p, "\n");
+	(void)!write(2, buf, (size_t)(p - buf));
+
+	p = d_str(buf, "slab: geometry page=");
+	p = d_num(p, page());
+	p = d_str(p, " span=");
+	p = d_num(p, SPAN_SIZE);
+	p = d_str(p, " hdr=");
+	p = d_num(p, HDR);
+	p = d_str(p, " maxsmall=");
+	p = d_num(p, MAXSMALL);
 	p = d_str(p, "\n");
 	(void)!write(2, buf, (size_t)(p - buf));
 
