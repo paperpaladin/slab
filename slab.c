@@ -39,6 +39,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdlib.h>
 #include <sys/auxv.h>
 #include <pthread.h>
 #include <sched.h>
@@ -326,6 +327,8 @@ static void note(const char *s) { (void)!write(2, s, strlen(s)); }
 
 static size_t round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
+
+
 /* Any pointer we ever returned -> the header of the span (or the large
  * mapping) it came from, in one AND.  A span-aligned pointer can only have
  * come from the over-aligned large path, whose header sits one span lower;
@@ -339,6 +342,138 @@ static struct hdr *hdr_of(void *p)
 						       : u - SPAN_SIZE);
 	return h->magic == MAGIC ? h : NULL;
 }
+
+/*
+ * THE FREE-LIST LINK, and the optional hardening on it.
+ *
+ * A free object's first eight bytes are the link to the next one.  That is
+ * what makes these lists cost no metadata, and it is also the whole attack
+ * surface: anything that writes to a freed object is writing the
+ * allocator's own pointer, and the next malloc hands back wherever it
+ * points.  Measured on the default build -- free two objects, overwrite the
+ * first eight bytes of the one at the head, allocate twice -- slab
+ * segfaults on the wild pointer, which is luck rather than detection; glibc
+ * says "malloc(): unaligned tcache chunk detected"; jemalloc 5 in its
+ * default build hands the attacker's address back and carries on.
+ *
+ * Default build: the link is stored plain and these are three macros that
+ * compile to nothing.
+ *
+ * -DSLAB_HARDEN: the link is stored XOR'd with the object's own address
+ * shifted right by twelve, which is glibc's safe-linking, so somebody who
+ * can write a freed object but does not know where it is cannot choose what
+ * comes out.  And every link read back has to be NULL, or 16-byte aligned
+ * and pointing at an object of the same class in some span of ours.  The
+ * class half is stronger than glibc's alignment check.
+ *
+ * It cannot be stronger still.  Requiring the successor to be in the SAME
+ * span as its holder would be exact for a span's own free list and is
+ * wrong for a magazine, which deliberately chains objects of one class
+ * across spans; the first version of this check did that and aborted inside
+ * `stress check`.
+ *
+ * A violation is a diagnostic and abort(), not a return value.  By the time
+ * a link is wrong the heap is not a thing to carry on allocating from.
+ * Note what is NOT caught cleanly: hdr_of() on a 16-byte-aligned wild
+ * pointer reads the word at that address rounded down to a span, which is
+ * usually unmapped, so the process dies of SIGSEGV inside the check rather
+ * than printing the line above.  That is the same exposure glibc has.
+ */
+#ifdef SLAB_HARDEN
+#define FL_ENC(p, v)  ((void *)((uintptr_t)(v) ^ ((uintptr_t)(p) >> 12)))
+
+static void fl_die(const char *why)
+{
+	note(why);
+	abort();
+}
+
+static void *fl_get(void *p, unsigned cls)
+{
+	void *v = FL_ENC(p, *(void **)p);
+	struct hdr *h;
+
+	if (!v)
+		return NULL;
+	if ((uintptr_t)v & 15)
+		fl_die("slab: free-list link is not 16-byte aligned\n");
+	h = hdr_of(v);
+	if (!h || h->cls != cls)
+		fl_die("slab: free-list link does not point into a span of "
+		       "its own class\n");
+	return v;
+}
+
+/*
+ * THE DOUBLE-FREE CHECK, and why it is not a scan.
+ *
+ * The obvious version walks the list looking for the object: complete for
+ * the list it walks, and 1.7x to 6.4x slower across the benchmark rows,
+ * because a magazine holds up to 512 objects and every free walks it.  That
+ * is not a cheap check, it is a different allocator.
+ *
+ * So, glibc's design.  A dead object's SECOND eight bytes hold a cookie
+ * read once from AT_RANDOM; the smallest class is 16 bytes, so there is
+ * always room, and the bytes are dead while the object is.  free() compares
+ * them, and only when they match -- which for a live object means an
+ * unlucky coincidence or an actual double free -- does it pay for a scan to
+ * find out which.  malloc clears the cookie on the way out, so an object
+ * that is allocated and freed without the owner writing those eight bytes
+ * does not trigger a scan every time round.
+ *
+ * What it catches: a double free on the thread that owns the magazine, and
+ * one that has reached a span's own free list.  What it does not: two
+ * different threads each freeing the same object into their own magazine,
+ * because the other thread's magazine cannot be read without locking it,
+ * and locking it is the thing magazines exist to avoid.
+ */
+static uintptr_t fl_cookie_v;
+
+static uintptr_t fl_cookie(void)
+{
+	if (!fl_cookie_v) {
+		unsigned long r = getauxval(AT_RANDOM);
+
+		/* AT_RANDOM is sixteen bytes the kernel put on the stack.  If
+		 * it is missing, any nonzero constant still catches an
+		 * accidental double free; what it stops being is a defence
+		 * against somebody who can write the heap on purpose. */
+		fl_cookie_v = r ? *(uintptr_t *)r : (uintptr_t)0x5b1ab10cd00db1eULL;
+		fl_cookie_v |= 1;
+	}
+	return fl_cookie_v;
+}
+
+#define FL_KEY(p) (((uintptr_t *)(p))[1])
+
+static void fl_check_absent(void *head, void *p, unsigned cls, const char *why)
+{
+	while (head) {
+		if (head == p)
+			fl_die(why);
+		head = fl_get(head, cls);
+	}
+}
+
+/* Called on free, before p is put on `head`. */
+static void fl_mark(void *head, void *p, unsigned cls, const char *why)
+{
+	if (FL_KEY(p) == fl_cookie())
+		fl_check_absent(head, p, cls, why);
+	FL_KEY(p) = fl_cookie();
+}
+
+#define FL_SET(p, v)      (*(void **)(p) = FL_ENC((p), (v)))
+#define FL_GET(p, cls)    fl_get((p), (cls))
+#define FL_TAKE(p)        (FL_KEY(p) = 0)
+#define FL_ABSENT(h, p, cls, why)  fl_mark((h), (p), (cls), (why))
+#else
+#define FL_SET(p, v)      (*(void **)(p) = (v))
+#define FL_GET(p, cls)    ((void)(cls), *(void **)(p))
+#define FL_TAKE(p)        ((void)(p))
+#define FL_ABSENT(h, p, cls, why)  ((void)(h), (void)(p), (void)(cls), (void)(why))
+#endif
+
 
 
 /*
@@ -512,7 +647,10 @@ static void free_small(struct hdr *h, void *p)
 {
 	int wasfull = !h->freelist && h->bump == h->cap;
 
-	*(void **)p = h->freelist;
+	FL_ABSENT(h->freelist, p, h->cls,
+		  "slab: double free (the object is already on its span's "
+		  "free list)\n");
+	FL_SET(p, h->freelist);
 	h->freelist = p;
 	if (wasfull) {
 		h->next = klass[h->cls].partial;
@@ -552,7 +690,8 @@ static void *alloc_small(unsigned cls, int *fresh)
 	}
 	if (h->freelist) {
 		p = h->freelist;
-		h->freelist = *(void **)p;
+		h->freelist = FL_GET(p, cls);
+		FL_TAKE(p);
 		*fresh = 0;
 	} else {
 		p = (char *)h + h->bump;
@@ -726,7 +865,7 @@ static unsigned tc_sweep(void)
 			void *p = t->m[cls].head;
 
 			while (p) {
-				void *next = *(void **)p;
+				void *next = FL_GET(p, cls);
 				struct hdr *h = hdr_of(p);
 
 				if (h)
@@ -762,7 +901,7 @@ static void mag_drain(unsigned cls)
 
 	lock();
 	while (p) {
-		void *next = *(void **)p;
+		void *next = FL_GET(p, cls);
 		struct hdr *h = hdr_of(p);
 		if (h)
 			free_small(h, p);
@@ -807,7 +946,7 @@ static void *mag_refill(unsigned cls, int *fresh)
 		p = alloc_small(cls, &f);
 		if (!p)
 			break;
-		*(void **)p = m->head;
+		FL_SET(p, m->head);
 		m->head = p;
 		m->n++;
 	}
@@ -822,7 +961,8 @@ static void *small(unsigned cls, int *fresh)
 
 	if (t && t->m[cls].head) {
 		p = t->m[cls].head;
-		t->m[cls].head = *(void **)p;
+		t->m[cls].head = FL_GET(p, cls);
+		FL_TAKE(p);
 		t->m[cls].n--;
 		*fresh = 0;
 		return p;
@@ -1199,7 +1339,10 @@ void free(void *p)
 	struct hdr *hh = hdr_of(p);
 	if (hh && hh->cls != CLS_LARGE && tc) {
 		struct mag *m = &tc->m[hh->cls];
-		*(void **)p = m->head;
+		FL_ABSENT(m->head, p, hh->cls,
+			  "slab: double free (the object is already on this "
+			  "thread's magazine)\n");
+		FL_SET(p, m->head);
 		m->head = p;
 		m->n++;
 		if ((size_t)m->n * cls_size[hh->cls] > MAG_BYTES)

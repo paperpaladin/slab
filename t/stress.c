@@ -811,6 +811,71 @@ static void check_frag(const char *path)
 	check_geometry(path);
 }
 
+/* ---------------- abuse mode ----------------
+ *
+ * Deliberate heap abuse, so that the hardened build has something to catch
+ * and the ordinary build has something to be honest about. Each of these
+ * prints what the allocator did and exits 0; under -DSLAB_HARDEN they are
+ * expected to die before printing anything, and t/run.sh asserts that.
+ *
+ * Nothing in the rest of the suite runs these. They are not a check of
+ * slab, they are a check of the check.
+ */
+static int check_abuse(const char *what)
+{
+	if (!strcmp(what, "doublefree")) {
+		void *a = launder(malloc(64)), *b, *c;
+
+		free(a);
+		free(a);
+		b = launder(malloc(64));
+		c = launder(malloc(64));
+		printf("abuse: after a double free, two allocations came back "
+		       "at %p and %p (%s)\n", b, c,
+		       b == c ? "THE SAME ADDRESS" : "different addresses");
+		return 0;
+	}
+	if (!strcmp(what, "uaflink")) {
+		unsigned char *a = launder(malloc(64));
+		unsigned char *b = launder(malloc(64));
+		void *x, *y;
+
+		free(a);
+		free(b);
+		memset(b, 0x41, 8);     /* overwrite the free-list link */
+		x = launder(malloc(64));
+		y = launder(malloc(64));
+		printf("abuse: after overwriting a freed object's link with "
+		       "0x41s, malloc returned %p and %p\n", x, y);
+		return 0;
+	}
+	if (!strcmp(what, "uafaligned")) {
+		/* The same, with a 16-byte-aligned address that an attacker
+		 * would have chosen. An alignment check alone does not see
+		 * this one; safe-linking does, because what the allocator
+		 * decodes is the written value XOR'd with the object's own
+		 * address and is not what was aimed at. */
+		static long target[16];
+		unsigned char *a = launder(malloc(64));
+		unsigned char *b = launder(malloc(64));
+		void *t = (void *)(((uintptr_t)target + 15) & ~(uintptr_t)15);
+		void *x, *y;
+
+		free(a);
+		free(b);
+		memcpy(b, &t, sizeof t);
+		x = launder(malloc(64));
+		y = launder(malloc(64));
+		printf("abuse: after pointing a freed object's link at %p, "
+		       "malloc returned %p and %p (%s)\n", t, x, y,
+		       x == t || y == t ? "THE ADDRESS THAT WAS WRITTEN"
+				        : "not the address that was written");
+		return 0;
+	}
+	fprintf(stderr, "abuse: unknown abuse '%s'\n", what);
+	return 2;
+}
+
 /* ---------------- fork mode ----------------
  *
  * A multithreaded program that fork()s without exec()ing. POSIX says only
@@ -1749,6 +1814,8 @@ int main(int argc, char **argv)
 		check_tlb(n ? n : 2000000, 20000000);
 	} else if (!strcmp(mode, "huge")) {
 		check_huge(n ? n : 400000);
+	} else if (!strcmp(mode, "abuse")) {
+		return check_abuse(argc > 2 ? argv[2] : "doublefree");
 	} else if (!strcmp(mode, "fork")) {
 		check_fork(n ? n : 200);
 	} else if (!strcmp(mode, "sweep")) {
@@ -1806,7 +1873,8 @@ int main(int argc, char **argv)
 	} else {
 		fprintf(stderr,
 			"usage: stress check|guard|reclaim|huge|tlb|fork|"
-			"frag PATH|sweep PATH|stress|thread|tchurn|bench [n]\n");
+			"abuse WHAT|frag PATH|sweep PATH|stress|thread|"
+			"tchurn|bench [n]\n");
 		return 2;
 	}
 
