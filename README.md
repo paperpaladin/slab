@@ -34,7 +34,11 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 76 checks in three tiers, plus a recorded corpus.
+`make test` runs 76 checks in three tiers, plus a recorded corpus. One of
+them, the huge-page check, reports 75 passed and 1 skipped on a machine
+whose kernel is refusing to find 2 MiB blocks; see
+[Huge pages](#huge-pages-and-a-win-none-of-the-benchmarks-could-see) for
+what that distinguishes and what it still fails on.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
@@ -156,7 +160,7 @@ ok    peak RSS 1.12x glibc on a churn workload (limit 3.0x)
 ok    fork: a multithreaded process forks and the child allocates
 ok    fork: glibc malloc survives it too, so the oracle is right
 ok    magazine sweep: 64 dead threads held 11087 KiB on their magazines, 7 KiB left after the next arena was wanted
-ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects
+ok    huge pages: AnonHugePages 2048 -> 26624 KiB over 25000 KiB of 64-byte objects, with 24576 KiB of arenas madvised and 2 MiB-aligned
 ok    fragmentation: 15 bytes of slack at or below 128, and 4097 bytes requested in a 5120-byte class = 19.98% of the allocation wasted
 ok    fragmentation: 20000 objects, 81251 KiB requested, 88012 KiB in classes (7.68% of the allocation wasted), 1453 spans holding 92992 KiB (94% occupied by live objects)
 ok    geometry: page=4096, span=65536 (sysconf says 4096, AT_PAGESZ says 4096)
@@ -611,11 +615,55 @@ slab, after          38.3 ns    126976 KiB      144 MB
 still the smallest resident of the five.
 
 The oracle is the kernel rather than the return value: `MADV_HUGEPAGE` is
-advice and returns 0 on a kernel with `transparent_hugepage=never`, so the
-check reads `AnonHugePages` out of `/proc/self/smaps_rollup` and demands
-three quarters of the bytes asked for. It skips itself, loudly and counted,
-when THP is not in `madvise` mode, because with `never` nothing can be
-backed and with `always` every allocator gets huge pages without asking.
+advice and returns 0 on a kernel with `transparent_hugepage=never`. The
+check reads three things out of `/proc`, and keeping them apart is the whole
+design of it.
+
+`AnonHugePages` in `/proc/self/smaps_rollup` is how much of the process is
+really backed by 2 MiB pages, and the check wants three quarters of the
+bytes it asked for. That number is the kernel's decision, taken against
+whatever contiguous memory the machine has at that minute, so on its own it
+cannot say whether a shortfall is slab's fault. Two facts in
+`/proc/self/smaps` can. `hg` in a VMA's `VmFlags` line is the kernel
+confirming `MADV_HUGEPAGE` was recorded against that mapping, and the start
+address of such a VMA says whether a 2 MiB page could go there at all.
+Measured on the 400,000-object workload: seven 4096 KiB `hg` VMAs, one per
+arena, all 2 MiB-aligned, against none at all under glibc malloc. The check
+reads the figure twice and uses the difference, so the number it prints is
+24576 KiB rather than 28672: one arena already existed when the workload
+started.
+
+So the mode has three answers rather than two:
+
+```
+hg recorded, three quarters of the bytes backed    pass
+hg recorded, 2 MiB-aligned, the bytes short        the kernel declined: SKIP
+hg absent, or any of it off a 2 MiB boundary       slab's defect: FAIL
+```
+
+The middle one is why this is written down. On 2 November 2026 the suite
+went red here with THP in `madvise` mode, slab asking, and the kernel
+declining anyway: `MemFree` 285 MB against `MemAvailable` of 8.3 GB, and
+system-wide `AnonHugePages` at 0 kB. Nothing in slab had changed. The skip
+prints `MemFree` and the system-wide `AnonHugePages` with it, so the line
+says which of the three it is rather than only that it gave up.
+
+The trap in that repair is that a skip on the byte count alone makes the
+whole mode vacuous: the mutant that deletes the `madvise` would skip too,
+and the suite would report it as killed. Both huge-page mutants now die on a
+fact the kernel does not get a vote on. Deleting the `madvise` leaves no
+`hg` anywhere, 0 KiB against 24576. Aligning the arenas to a span instead
+leaves the `hg` flags in place and puts the arenas off a 2 MiB boundary,
+six of seven in one run and all seven in another, since a 64 KiB-aligned
+region lands on 2 MiB by luck one time in 32. Both were watched to fail with the byte threshold forced high
+enough that the kernel looked as though it were declining, which is the run
+that matters: the mode was skipping, and they still failed.
+
+It still skips before allocating anything when THP is not in `madvise`
+mode, because with `never` nothing can be backed and with `always` every
+allocator gets huge pages without asking. Whether the kernel still records
+`hg` under `never` is not known here: changing the system-wide setting needs
+root, so that skip was left as it was rather than narrowed on a guess.
 
 ### What it costs, on the shape it is worst for
 

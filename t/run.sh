@@ -291,22 +291,27 @@ else
 	grep '^  FAIL' "$T/sw.out" | head -3 | sed 's/^/        /'
 fi
 
-# Huge pages, with the kernel as the oracle: AnonHugePages in
-# /proc/self/smaps_rollup is the kernel saying how much of the process is
-# really backed by 2 MiB pages. madvise returning 0 says nothing, since
-# MADV_HUGEPAGE is advice. The mode skips itself when
-# transparent_hugepage is not in madvise mode, because with "never" nothing
-# can be backed and with "always" every allocator gets huge pages without
-# asking and the check would be about the kernel's default.
+# Huge pages, with the kernel as the oracle for two facts rather than one.
+# AnonHugePages in /proc/self/smaps_rollup is how much of the process is
+# really backed by 2 MiB pages; the hg flag in /proc/self/smaps is whether
+# MADV_HUGEPAGE was recorded against a mapping at all. madvise returning 0
+# says nothing about either, since it is advice.
+#
+# So the mode has three answers. hg recorded and the bytes there is a pass.
+# hg recorded and the bytes short is the kernel declining, which it did on
+# this machine on 2 November 2026 with MemFree at 285 MB, and the mode skips
+# and prints what it measured. hg absent is slab not asking, and only that
+# is a failure here: the byte count moves with the machine's memory and the
+# flag does not.
 if LD_PRELOAD="$SLAB" ./t/stress huge >"$T/hg.out" 2>&1; then
 	if grep -q SKIP "$T/hg.out"; then
 		skipped=$((skipped + 1))
-		printf 'SKIP %s\n' "$(sed -n 's/^huge: //p' "$T/hg.out")"
+		printf 'SKIP %s\n' "$(sed -n 's/^huge: SKIP, //p' "$T/hg.out")"
 	else
 		ok "huge pages: $(sed -n 's/^huge: //p' "$T/hg.out")"
 	fi
 else
-	bad "huge pages: the kernel did not back the arenas with any"
+	bad "huge pages: slab is not asking the kernel for them"
 	grep '^  FAIL' "$T/hg.out" | head -2 | sed 's/^/        /'
 fi
 
@@ -691,10 +696,20 @@ mutant "a sweep that drops the magazines instead of returning them" "sweep" \
 	's|\t\t\t\t\tfree_small(h, p);|\t\t\t\t\t(void)h;|' \
 	"$T/msweep.txt"
 
-# Huge pages. The second is the one worth having: a 4 MiB arena contains an
-# aligned 2 MiB block wherever it starts, so a span-aligned arena still gets
-# half of itself backed (12288 KiB against 26624), and the first threshold
-# this check used -- a quarter of the bytes asked for -- let it through.
+# Huge pages. The two die on different facts, and neither of them is the
+# byte count, which moves with how much contiguous memory the machine
+# happens to have. The first never calls madvise, so nothing carries hg.
+# The second does, so it is caught by where it asked: six of its seven
+# arenas started off a 2 MiB boundary in one run and all seven in another,
+# and no huge page can go on any of those.
+#
+# The byte count had been carrying the second one alone, at three quarters
+# of the bytes requested, because a 4 MiB arena contains an aligned 2 MiB
+# block wherever it starts and a span-aligned arena therefore still gets
+# half of itself backed, 12288 KiB against 26624. The quarter threshold
+# this check started with let it through. It is still the pass criterion,
+# and it is no longer the only thing standing between that mutant and a
+# skip.
 mutant "arenas that never ask for huge pages" "huge" \
 	's|\t\tmadvise(a, ARENA_LEN, MADV_HUGEPAGE);|\t\t(void)0;|'
 mutant "arenas aligned to a span instead of a huge page" "huge" \

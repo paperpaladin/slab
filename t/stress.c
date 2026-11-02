@@ -493,16 +493,45 @@ static void *worker(void *arg)
 
 /* ---------------- huge mode ----------------
  *
- * SLAB-SPECIFIC, and the kernel is the oracle: AnonHugePages in
- * /proc/self/smaps_rollup is the kernel saying how much of this process is
- * actually backed by 2 MiB pages.  mmap and madvise returning 0 says
- * nothing -- MADV_HUGEPAGE is advice, and on a kernel with
- * transparent_hugepage=never it is advice that is ignored.
+ * SLAB-SPECIFIC, and the kernel is the oracle for two separate facts that
+ * are easy to run together:
  *
- * That is also why the mode SKIPS rather than fails when THP is off or
- * set to "always": with "never" nothing can be backed, and with "always"
- * every allocator gets huge pages without asking and the check would be
- * about the kernel's default rather than about slab's madvise.
+ * 1. `hg` in a VMA's VmFlags line in /proc/self/smaps is the kernel saying
+ *    MADV_HUGEPAGE has been recorded for that mapping.  Slab either gave
+ *    that advice or it did not, and nothing about the machine's free memory
+ *    can change the answer.
+ * 2. AnonHugePages in /proc/self/smaps_rollup is the kernel saying how much
+ *    of this process is really backed by 2 MiB pages.  That is the kernel's
+ *    own decision, taken against whatever contiguous memory it can find at
+ *    the time.
+ *
+ * mmap and madvise returning 0 say nothing about either, since
+ * MADV_HUGEPAGE is advice.
+ *
+ * Reading AnonHugePages alone gives two outcomes where there are three, and
+ * the missing one is what turned this check red on 2 November 2026: THP in
+ * madvise mode, slab asking, and the kernel declining anyway, with MemFree
+ * at 285 MB and system-wide AnonHugePages at 0 kB.  So:
+ *
+ *   hg recorded, enough bytes backed   pass
+ *   hg recorded, bytes short           the kernel declined.  SKIP, printing
+ *                                      MemFree and the system-wide
+ *                                      AnonHugePages, so the line says why
+ *                                      rather than only that it skipped
+ *   hg not recorded                    slab did not ask.  FAIL, whatever
+ *                                      the byte count happens to say
+ *
+ * Skipping on the byte count alone would make the mode vacuous, because the
+ * mutant that deletes the madvise would skip as well.  The hg flag is what
+ * keeps that mutant dead, and it kills it on something the kernel's mood
+ * does not reach.
+ *
+ * The mode still SKIPS before allocating anything when THP is off or set to
+ * "always": with "never" nothing can be backed, and with "always" every
+ * allocator gets huge pages without asking and the check would be about the
+ * kernel's default rather than about slab's madvise.  Whether the kernel
+ * still records hg under "never" is not known here, since changing the
+ * system-wide setting needs root, so that skip is left as it was.
  */
 static int thp_madvise_mode(void)
 {
@@ -517,9 +546,13 @@ static int thp_madvise_mode(void)
 	return strstr(line, "[madvise]") != NULL;
 }
 
-static long smaps_rollup(const char *key)
+#define ROLLUP "/proc/self/smaps_rollup"
+
+/* The first "key" line of a /proc file, as the kB figure it carries.  Read
+ * from smaps_rollup for this process and from meminfo for the machine. */
+static long proc_kb(const char *path, const char *key)
 {
-	FILE *f = fopen("/proc/self/smaps_rollup", "r");
+	FILE *f = fopen(path, "r");
 	char line[256];
 	long v = -1;
 
@@ -535,10 +568,53 @@ static long smaps_rollup(const char *key)
 	return v;
 }
 
+#define HUGE_PAGE (2UL * 1024 * 1024)
+
+/* The kB of mapping this process has had MADV_HUGEPAGE recorded against:
+ * sum the Size: of every VMA whose VmFlags line carries hg.  Every VmFlags
+ * token is two letters, so " hg" cannot match part of another one.  Also
+ * returns, through *unaligned, how much of that does not begin on a 2 MiB
+ * boundary, which a huge page cannot back whatever the kernel has free.
+ *
+ * Measured on this workload: seven 4096 KiB VMAs, one per 4 MiB arena, all
+ * 2 MiB-aligned.  Under glibc malloc, and with slab's madvise call deleted,
+ * there are none at all.  With the arenas aligned to a span instead there
+ * are still seven, of which six were off a 2 MiB boundary in one run and
+ * all seven in another: a 64 KiB-aligned region lands on 2 MiB by luck one
+ * time in 32, so any of them being off is the signal and all seven landing
+ * right would take one run in 3e10. */
+static long smaps_hg_kb(long *unaligned)
+{
+	FILE *f = fopen("/proc/self/smaps", "r");
+	char line[512];
+	unsigned long start = 0, a, b;
+	long sz = 0, tot = 0;
+
+	*unaligned = 0;
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof line, f)) {
+		if (sscanf(line, "%lx-%lx", &a, &b) == 2) {
+			start = a;
+			sz = 0;
+		} else if (!strncmp(line, "Size:", 5)) {
+			sscanf(line + 5, "%ld", &sz);
+		} else if (!strncmp(line, "VmFlags:", 8) &&
+			   strstr(line, " hg")) {
+			tot += sz;
+			if (start & (HUGE_PAGE - 1))
+				*unaligned += sz;
+		}
+	}
+	fclose(f);
+	return tot;
+}
+
 static void check_huge(long nobj)
 {
 	void **v;
-	long i, before, after, want;
+	long i, before, after, hgbefore, hgafter, asked, got, objkb, want;
+	long unaligned, dummy;
 
 	if (!thp_madvise_mode()) {
 		printf("huge: SKIP, transparent_hugepage is not in madvise "
@@ -550,9 +626,13 @@ static void check_huge(long nobj)
 	if (!v)
 		return;
 	memset(v, 0, (size_t)nobj * sizeof *v);
-	before = smaps_rollup("AnonHugePages:");
+	before = proc_kb(ROLLUP, "AnonHugePages:");
 	CHECK(before >= 0, "no AnonHugePages line in /proc/self/smaps_rollup");
 	if (before < 0)
+		return;
+	hgbefore = smaps_hg_kb(&dummy);
+	CHECK(hgbefore >= 0, "could not read /proc/self/smaps");
+	if (hgbefore < 0)
 		return;
 	for (i = 0; i < nobj; i++) {
 		v[i] = malloc(64);
@@ -562,7 +642,11 @@ static void check_huge(long nobj)
 		}
 		*(unsigned char *)v[i] = 1;
 	}
-	after = smaps_rollup("AnonHugePages:");
+	after = proc_kb(ROLLUP, "AnonHugePages:");
+	hgafter = smaps_hg_kb(&unaligned);
+	objkb = nobj * 64 / 1024;
+	asked = hgafter - hgbefore;
+	got = after - before;
 	/* Three quarters of the bytes asked for.  Measured at 26624 KiB for
 	 * 25000 KiB of objects, so 1.4x of headroom for a kernel that cannot
 	 * find a free 2 MiB block for every arena -- and tight enough to
@@ -570,13 +654,40 @@ static void check_huge(long nobj)
 	 * page, which still gets 12288 KiB (49%) because a 4 MiB region
 	 * happens to contain one aligned 2 MiB block wherever it starts.
 	 * A quarter was the first threshold here and that mutant survived it. */
-	want = nobj * 64 / 1024 * 3 / 4;
+	want = objkb * 3 / 4;
+	/* Did slab ask at all?  One arena's worth is the floor: the arenas are
+	 * 4 MiB each and this workload madvises seven of them.  Deleting the
+	 * madvise gives 0 KiB here, so the margin either side of 4096 is the
+	 * whole measurement, not a tuned threshold. */
+	CHECK(asked >= 4096,
+	      "the hg flag in /proc/self/smaps covers %ld KiB more than before "
+	      "the workload, where a 4096 KiB arena is the least slab can "
+	      "madvise: MADV_HUGEPAGE is not being asked for", asked);
+	if (asked < 4096)
+		return;
+	/* And did it ask about memory a huge page can be put on?  This is the
+	 * other half that must not be allowed to become a skip: an arena
+	 * aligned to a span instead is madvised just the same, and it is the
+	 * kernel's own VMA start address that says which one happened. */
+	CHECK(unaligned == 0,
+	      "%ld KiB of the madvised arenas do not start on a 2 MiB "
+	      "boundary, so no huge page can back them however much memory is "
+	      "free: the arenas are not being aligned to a huge page",
+	      unaligned);
+	if (unaligned)
+		return;
+	if (got < want) {
+		printf("huge: SKIP, slab madvised %ld KiB of 2 MiB-aligned "
+		       "arenas and the kernel backed %ld KiB of the %ld "
+		       "wanted, so it is declining: MemFree %ld kB, system "
+		       "AnonHugePages %ld kB\n", asked, got, want,
+		       proc_kb("/proc/meminfo", "MemFree:"),
+		       proc_kb("/proc/meminfo", "AnonHugePages:"));
+		return;
+	}
 	printf("huge: AnonHugePages %ld -> %ld KiB over %ld KiB of 64-byte "
-	       "objects\n", before, after, nobj * 64 / 1024);
-	CHECK(after - before >= want,
-	      "the kernel backed %ld KiB with huge pages where at least %ld "
-	      "was expected: MADV_HUGEPAGE on the arenas is not taking effect",
-	      after - before, want);
+	       "objects, with %ld KiB of arenas madvised and 2 MiB-aligned\n",
+	       before, after, objkb, asked);
 	for (i = 0; i < nobj; i++)
 		free(v[i]);
 	free(v);
@@ -1611,7 +1722,7 @@ static void check_tlb(long nobj, long naccess)
 	printf("tlb: %.1f ns/access over %ld live 64-byte objects, "
 	       "AnonHugePages %ld KiB, Rss %ld KiB (checksum %lu)\n",
 	       (now() - t0) / (double)naccess * 1e9, nobj,
-	       smaps_rollup("AnonHugePages:"), smaps_rollup("Rss:"), acc);
+	       proc_kb(ROLLUP, "AnonHugePages:"), proc_kb(ROLLUP, "Rss:"), acc);
 	for (i = 0; i < nobj; i++)
 		free(v[i]);
 	free(v);

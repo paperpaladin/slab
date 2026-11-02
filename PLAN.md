@@ -599,6 +599,32 @@ Ranked by how much it would embarrass us to fail it.
         every allocator gets huge pages without asking, so the check would
         be about the kernel's default rather than about slab. 25 runs, 25
         passes, no flakiness. glibc fails it.
+      - "no flakiness" lasted until 2 November 2026, when the suite went red
+        here with nothing in slab changed: THP in madvise mode, slab
+        asking, and the kernel declining, MemFree 285 MB against
+        MemAvailable of 8.3 GB and system-wide AnonHugePages at 0 kB. The
+        byte count is the kernel's decision rather than slab's behaviour, so
+        it cannot carry a pass/fail on its own, and 25 green runs only
+        measured the machine those runs happened on.
+      - the repair is two more facts out of /proc/self/smaps, both of them
+        about the advice rather than about the backing: `hg` in a VMA's
+        VmFlags line says MADV_HUGEPAGE was recorded against that mapping,
+        and the VMA's start address says whether a 2 MiB page could go there.
+        Seven 4096 KiB hg VMAs on this workload, one per arena, all
+        2 MiB-aligned; none at all under glibc. So the mode now answers
+        three ways: advice recorded and the bytes there is a pass, advice
+        recorded and the bytes short is the kernel declining and skips with
+        MemFree and the system-wide AnonHugePages printed, and advice absent
+        or misaligned fails.
+      - the trap was that a skip on the byte count alone makes the mode
+        vacuous, since the mutant that deletes the madvise would skip too
+        and be recorded as killed. Both mutants were rebuilt and run with
+        the threshold forced high enough that the mode was skipping for
+        honest slab: deleting the madvise fails on 0 KiB of hg against
+        24576, and aligning the arenas to a span fails on six of seven
+        starting off a 2 MiB boundary. Neither depends on the byte count any
+        more. The suite prints 75 passed, 0 failed, 1 skipped in that state,
+        with both mutants still dying.
 - [x] Return a dead thread's magazines eagerly, not on adoption.
       - why: adoption bounds the stranded memory by peak thread count, not by
         threads created, which is enough for a thread pool and not for a
