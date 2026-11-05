@@ -34,11 +34,29 @@ classes are exact 16-byte steps and the worst slack is 15 bytes. See
 
 ## The oracle
 
-`make test` runs 76 checks in three tiers, plus a recorded corpus. One of
-them, the huge-page check, reports 75 passed and 1 skipped on a machine
-whose kernel is refusing to find 2 MiB blocks; see
-[Huge pages](#huge-pages-and-a-win-none-of-the-benchmarks-could-see) for
-what that distinguishes and what it still fails on.
+`make test` runs 76 checks in three tiers, plus a recorded corpus. The
+summary line it ends on is one of two, and which one it is was decided by the
+kernel rather than by anything in slab:
+
+76 passed, 0 failed, 0 skipped
+
+when the kernel backs the arenas with 2 MiB pages, and
+
+75 passed, 0 failed, 1 skipped
+
+when transparent huge pages are in `madvise` mode, slab asks, and the kernel
+declines for want of contiguous memory. Both were printed here on 5 November
+2026, minutes apart, with nothing in the tree changed in between.
+
+Both are written down because the figure is a fact about the machine as much
+as about the suite. There are 76 checks either way, and the one that can skip
+reports the kernel's decision rather than slab's behaviour, so a single figure
+here would be wrong on whichever machine got the other answer. The
+collection's audit compares what its last rebuild recorded against every count
+this README quotes, so it agrees with either run and still goes red if the
+suite moves to a third number. See
+[Huge pages](#huge-pages-and-a-win-none-of-the-benchmarks-could-see) for what
+the skip distinguishes and what it still fails on.
 
 Tier 1, and the whole point: real system binaries, run twice, once
 normally, once with `LD_PRELOAD=./libslab.so`, demanding that stdout,
